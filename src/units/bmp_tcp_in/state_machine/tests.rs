@@ -252,7 +252,6 @@ fn peer_up_route_monitoring_peer_down() {
     assert!(matches!(res.message_type, MessageType::Other));
     let processor = res.next_state;
 
-
     // Check the metrics
     assert_metrics(&processor, ("Dumping", [1, 0, 0, 0, 0, 0, 2, 0, 0, 0]));
     //               ^ 1 connected router
@@ -442,9 +441,7 @@ fn peer_down_cleans_up_synthesized_siblings() {
             .details
             .peer_states
             .get_peers()
-            .filter_map(|pph| {
-                p.details.peer_states.get_peer_ingress_id(pph)
-            })
+            .filter_map(|pph| p.details.peer_states.get_peer_ingress_id(pph))
             .collect();
         let synth = *ids
             .iter()
@@ -461,8 +458,7 @@ fn peer_down_cleans_up_synthesized_siblings() {
 
     // PeerDown for the original (pre-policy) PPH must clean up the
     // genuine entry AND the synthesized sibling.
-    let res =
-        processor.process_msg(Instant::now(), peer_down_msg_buf, None);
+    let res = processor.process_msg(Instant::now(), peer_down_msg_buf, None);
 
     let MessageType::RoutingUpdate { update } = res.message_type else {
         panic!(
@@ -477,11 +473,7 @@ fn peer_down_cleans_up_synthesized_siblings() {
             other
         ),
     };
-    assert_eq!(
-        entries.len(),
-        2,
-        "WithdrawBulk should cover both ingresses"
-    );
+    assert_eq!(entries.len(), 2, "WithdrawBulk should cover both ingresses");
     assert!(
         entries.iter().any(|(id, _)| *id == original_ingress_id),
         "WithdrawBulk should include the original ingress_id"
@@ -493,7 +485,7 @@ fn peer_down_cleans_up_synthesized_siblings() {
     assert!(
         synth_entry.1.is_some(),
         "synthesized ingress entry must carry an inline IngressInfo \
-         snapshot — otherwise BMP out would race the register cleanup \
+         snapshot - otherwise BMP out would race the register cleanup \
          and emit a Peer Down with default PPH"
     );
 
@@ -581,9 +573,7 @@ fn peer_down_cleans_up_when_carrying_synthesized_pph() {
             .details
             .peer_states
             .get_peers()
-            .filter_map(|pph| {
-                p.details.peer_states.get_peer_ingress_id(pph)
-            })
+            .filter_map(|pph| p.details.peer_states.get_peer_ingress_id(pph))
             .collect();
         let synth = *ids
             .iter()
@@ -598,8 +588,7 @@ fn peer_down_cleans_up_when_carrying_synthesized_pph() {
         unreachable!("expected Dumping after RouteMonitoring");
     };
 
-    let res =
-        processor.process_msg(Instant::now(), peer_down_msg_buf, None);
+    let res = processor.process_msg(Instant::now(), peer_down_msg_buf, None);
 
     let MessageType::RoutingUpdate { update } = res.message_type else {
         panic!(
@@ -614,11 +603,7 @@ fn peer_down_cleans_up_when_carrying_synthesized_pph() {
             other
         ),
     };
-    assert_eq!(
-        entries.len(),
-        2,
-        "WithdrawBulk should cover both ingresses"
-    );
+    assert_eq!(entries.len(), 2, "WithdrawBulk should cover both ingresses");
     let synth_entry = entries
         .iter()
         .find(|(id, _)| *id == synthesized_ingress_id)
@@ -626,7 +611,7 @@ fn peer_down_cleans_up_when_carrying_synthesized_pph() {
     assert!(
         synth_entry.1.is_some(),
         "synthesized ingress entry must carry an inline IngressInfo \
-         snapshot — its register entry has just been removed"
+         snapshot - its register entry has just been removed"
     );
     let orig_entry = entries
         .iter()
@@ -641,7 +626,7 @@ fn peer_down_cleans_up_when_carrying_synthesized_pph() {
     if let BmpState::Dumping(p) = &res.next_state {
         assert!(
             p.details.peer_states.is_empty(),
-            "peer_states map should be empty after PeerDown — including \
+            "peer_states map should be empty after PeerDown - including \
              the original (non-synthesized) sibling that the previous \
              cleanup left behind"
         );
@@ -1485,7 +1470,6 @@ fn mk_test_processor() -> BmpState {
         Arc::default(),
     )
 }
-
 
 fn mk_initiation_msg(sys_name: &str, sys_descr: &str) -> BmpMsg<Bytes> {
     BmpMsg::from_octets(crate::bgp::encode::mk_initiation_msg(

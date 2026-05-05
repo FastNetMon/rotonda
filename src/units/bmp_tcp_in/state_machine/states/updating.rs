@@ -11,7 +11,10 @@ use routecore::{
         nlri::afisafi::Nlri,
         types::AfiSafiType,
     },
-    bmp::message::{InformationTlvIter, Message as BmpMsg, PerPeerHeader, TerminationMessage},
+    bmp::message::{
+        InformationTlvIter, Message as BmpMsg, PerPeerHeader,
+        TerminationMessage,
+    },
 };
 use smallvec::SmallVec;
 
@@ -204,7 +207,6 @@ impl Initiable for Updating {
         self.sys_desc = sys_desc;
         self.sys_extra = sys_extra;
     }
-
 }
 
 impl PeerAware for Updating {
@@ -237,7 +239,8 @@ impl PeerAware for Updating {
         dst_pph: &PerPeerHeader<Bytes>,
         ingress_id: IngressId,
     ) -> bool {
-        self.peer_states.add_cloned_peer_config(source_pph, dst_pph, ingress_id)
+        self.peer_states
+            .add_cloned_peer_config(source_pph, dst_pph, ingress_id)
     }
 
     fn get_peers(&self) -> Keys<'_, PerPeerHeader<Bytes>, PeerState> {
@@ -306,5 +309,4 @@ impl PeerAware for Updating {
     fn num_pending_eors(&self) -> usize {
         self.peer_states.num_pending_eors()
     }
-
 }
