@@ -28,14 +28,13 @@ use crate::{
     ingress::register::Register,
     manager::{Component, WaitPoint},
     payload::Update,
-    units::Unit,
     units::bgp_tcp_in::peer_config::PrefixOrExact,
+    units::Unit,
 };
 
 use super::{
-    bmp_builder,
-    client_handler,
-    client_state::ClientState,
+    bmp_builder, client_handler,
+    client_state::{BufferUpdateResult, ClientPhase, ClientState},
     metrics::BmpTcpOutMetrics,
     status_reporter::BmpTcpOutStatusReporter,
     tls,
@@ -218,31 +217,34 @@ struct BmpTcpOutRunner {
 #[async_trait]
 impl DirectUpdate for BmpTcpOutRunner {
     async fn direct_update(&self, update: Update) {
-        self.metrics.updates_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.metrics
+            .updates_received
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let clients = self.clients.read().await;
         for (_id, client) in clients.iter() {
-            if client.is_dumping().await {
-                // Buffer updates during initial dump
-                if !client.buffer_update(update.clone()).await {
+            match client.buffer_update_if_dumping(update.clone()).await {
+                BufferUpdateResult::Buffered => {}
+                BufferUpdateResult::Overflow => {
                     // Buffer overflow — mark for disconnect
                     self.status_reporter.buffer_overflow(client.remote_addr);
                     // Signal disconnect by closing the channel
                     let _ = client.tx.send(Vec::new()).await;
                 }
-            } else {
-                // Live phase — send directly
-                if !client_handler::send_update_to_client(
-                    client,
-                    &update,
-                    &self.ingress_register,
-                    self.forward_router_info,
-                )
-                .await
-                {
-                    debug!(
-                        "Failed to send update to client {}, will be cleaned up",
-                        client.remote_addr
-                    );
+                BufferUpdateResult::NotDumping => {
+                    // Live phase — send directly
+                    if !client_handler::send_update_to_client(
+                        client,
+                        &update,
+                        &self.ingress_register,
+                        self.forward_router_info,
+                    )
+                    .await
+                    {
+                        debug!(
+                            "Failed to send update to client {}, will be cleaned up",
+                            client.remote_addr
+                        );
+                    }
                 }
             }
         }
@@ -314,7 +316,8 @@ impl BmpTcpOutRunner {
                 Ok(listener) => break listener,
                 Err(err) => {
                     let msg = format!("{err}: Will retry in 5 seconds.");
-                    status_reporter.bind_error(&listen_addr.to_string(), &msg);
+                    status_reporter
+                        .bind_error(&listen_addr.to_string(), &msg);
                     sleep(Duration::from_secs(5)).await;
                 }
             }
@@ -323,7 +326,8 @@ impl BmpTcpOutRunner {
         status_reporter.listener_listening(&listen_addr.to_string());
 
         // Build TLS acceptor if TLS is enabled
-        let tls_acceptor: Option<tokio_rustls::TlsAcceptor> = if arc_self.tls {
+        let tls_acceptor: Option<tokio_rustls::TlsAcceptor> = if arc_self.tls
+        {
             let is_self_signed = arc_self.tls_cert.is_none();
             match tls::build_tls_acceptor(
                 arc_self.tls_cert.as_deref(),
@@ -331,7 +335,10 @@ impl BmpTcpOutRunner {
                 &listen_addr,
             ) {
                 Ok(acceptor) => {
-                    status_reporter.tls_enabled(&listen_addr.to_string(), is_self_signed);
+                    status_reporter.tls_enabled(
+                        &listen_addr.to_string(),
+                        is_self_signed,
+                    );
                     Some(acceptor)
                 }
                 Err(e) => {
@@ -383,8 +390,9 @@ impl BmpTcpOutRunner {
                                 bmp_builder::build_termination_message();
                             let clients = arc_self.clients.read().await;
                             for (_, client) in clients.iter() {
-                                let _ =
-                                    client.send_message(term_msg.clone()).await;
+                                let _ = client
+                                    .send_message(term_msg.clone())
+                                    .await;
                             }
                             return Err(Terminated);
                         }
@@ -394,8 +402,15 @@ impl BmpTcpOutRunner {
                     match accept_result {
                         Ok((tcp_stream, client_addr)) => {
                             let ip = client_addr.ip();
-                            if !arc_self.acl.iter().any(|entry| entry.contains(ip)) {
-                                warn!("ACL rejected connection from {}", client_addr);
+                            if !arc_self
+                                .acl
+                                .iter()
+                                .any(|entry| entry.contains(ip))
+                            {
+                                warn!(
+                                    "ACL rejected connection from {}",
+                                    client_addr
+                                );
                                 status_reporter.acl_rejected(client_addr);
                                 drop(tcp_stream);
                                 continue;
@@ -409,7 +424,10 @@ impl BmpTcpOutRunner {
                                 let arc_self = arc_self.clone();
                                 let status_reporter = status_reporter.clone();
                                 crate::tokio::spawn(
-                                    &format!("bmp-out-tls-handshake[{}]", client_addr),
+                                    &format!(
+                                        "bmp-out-tls-handshake[{}]",
+                                        client_addr
+                                    ),
                                     async move {
                                         match tokio::time::timeout(
                                             Duration::from_secs(10),
@@ -418,17 +436,29 @@ impl BmpTcpOutRunner {
                                         .await
                                         {
                                             Ok(Ok(tls_stream)) => {
-                                                let (_reader, writer) = tokio::io::split(tls_stream);
-                                                let writer: BoxedAsyncWrite = Box::new(writer);
+                                                let (_reader, writer) =
+                                                    tokio::io::split(
+                                                        tls_stream,
+                                                    );
+                                                let writer: BoxedAsyncWrite =
+                                                    Box::new(writer);
                                                 arc_self
-                                                    .handle_new_client(writer, client_addr)
+                                                    .handle_new_client(
+                                                        writer,
+                                                        client_addr,
+                                                    )
                                                     .await;
                                             }
                                             Ok(Err(e)) => {
-                                                status_reporter.tls_handshake_error(client_addr, e);
+                                                status_reporter
+                                                    .tls_handshake_error(
+                                                        client_addr,
+                                                        e,
+                                                    );
                                             }
                                             Err(_) => {
-                                                status_reporter.tls_handshake_error(
+                                                status_reporter
+                                                    .tls_handshake_error(
                                                     client_addr,
                                                     "handshake timeout (10s)",
                                                 );
@@ -437,8 +467,10 @@ impl BmpTcpOutRunner {
                                     },
                                 );
                             } else {
-                                let (_reader, writer) = tcp_stream.into_split();
-                                let writer: BoxedAsyncWrite = Box::new(writer);
+                                let (_reader, writer) =
+                                    tcp_stream.into_split();
+                                let writer: BoxedAsyncWrite =
+                                    Box::new(writer);
                                 arc_self
                                     .handle_new_client(writer, client_addr)
                                     .await;
@@ -565,7 +597,26 @@ impl BmpTcpOutRunner {
                         &sys_name, &sys_descr,
                     );
                     client.send_message(init_msg).await;
-                    client.set_live().await;
+
+                    let mut phase = client.phase.write().await;
+                    let buffered = client.take_buffered_updates().await;
+                    for update in buffered {
+                        if !client_handler::send_update_to_client(
+                            &client,
+                            &update,
+                            &ingress_register,
+                            forward_router_info,
+                        )
+                        .await
+                        {
+                            warn!(
+                                "Failed to drain buffered update for client {}",
+                                client_addr
+                            );
+                            break;
+                        }
+                    }
+                    *phase = ClientPhase::Live;
                 }
             },
         );

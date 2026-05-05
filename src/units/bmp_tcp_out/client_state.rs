@@ -20,6 +20,13 @@ pub enum ClientPhase {
     Live,
 }
 
+/// Result of trying to buffer an update for a dumping client.
+pub enum BufferUpdateResult {
+    Buffered,
+    NotDumping,
+    Overflow,
+}
+
 /// State for a single connected BMP consumer client.
 pub struct ClientState {
     /// Unique identifier for this client connection.
@@ -87,30 +94,27 @@ impl ClientState {
         }
     }
 
-    /// Check if client is in dumping phase.
-    pub async fn is_dumping(&self) -> bool {
-        *self.phase.read().await == ClientPhase::Dumping
-    }
+    /// Buffer an update only if the client is still in dump phase.
+    pub async fn buffer_update_if_dumping(
+        &self,
+        update: Update,
+    ) -> BufferUpdateResult {
+        let phase = self.phase.read().await;
+        if *phase != ClientPhase::Dumping {
+            return BufferUpdateResult::NotDumping;
+        }
 
-    /// Transition client to live phase.
-    pub async fn set_live(&self) {
-        *self.phase.write().await = ClientPhase::Live;
-    }
-
-    /// Buffer an update during dump phase.
-    /// Returns false if the buffer is full (client should be disconnected).
-    /// The buffer grows dynamically in 50k increments if >=512MB free RAM is available.
-    pub async fn buffer_update(&self, update: Update) -> bool {
         let mut buf = self.dump_buffer.lock().await;
         let current_limit = self.max_buffer.load(Ordering::Relaxed);
         if buf.len() >= current_limit {
             if available_ram_bytes() < MIN_FREE_RAM_BYTES {
-                return false;
+                return BufferUpdateResult::Overflow;
             }
-            self.max_buffer.store(current_limit + BUFFER_GROWTH_STEP, Ordering::Relaxed);
+            self.max_buffer
+                .store(current_limit + BUFFER_GROWTH_STEP, Ordering::Relaxed);
         }
         buf.push(update);
-        true
+        BufferUpdateResult::Buffered
     }
 
     /// Take all buffered updates (drain the buffer).
@@ -137,7 +141,10 @@ impl ClientState {
     }
 
     /// Mark peer as known and return true if it was not known before.
-    pub async fn register_known_peer_if_absent(&self, ingress_id: IngressId) -> bool {
+    pub async fn register_known_peer_if_absent(
+        &self,
+        ingress_id: IngressId,
+    ) -> bool {
         self.known_peers.write().await.insert(ingress_id)
     }
 
@@ -158,7 +165,10 @@ impl std::fmt::Debug for ClientState {
             .field("id", &self.id)
             .field("remote_addr", &self.remote_addr)
             .field("connected_at", &self.connected_at)
-            .field("messages_sent", &self.messages_sent.load(Ordering::Relaxed))
+            .field(
+                "messages_sent",
+                &self.messages_sent.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }

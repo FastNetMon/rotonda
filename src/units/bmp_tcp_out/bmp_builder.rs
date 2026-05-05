@@ -176,7 +176,11 @@ pub fn build_termination_message() -> Vec<u8> {
 }
 
 /// Build a synthetic BGP OPEN message.
-fn build_bgp_open(asn: Asn, is_ipv6: bool) -> Vec<u8> {
+fn build_bgp_open(
+    asn: Asn,
+    include_ipv6: bool,
+    advertise_graceful_restart: bool,
+) -> Vec<u8> {
     let mut caps = Vec::new();
 
     // Capability: 4-octet ASN (code 65)
@@ -191,7 +195,7 @@ fn build_bgp_open(asn: Asn, is_ipv6: bool) -> Vec<u8> {
     caps.push(0);
     caps.push(1); // SAFI=1
 
-    if is_ipv6 {
+    if include_ipv6 {
         // Capability: Multiprotocol Extensions - IPv6 Unicast
         caps.push(1);
         caps.push(4);
@@ -200,25 +204,25 @@ fn build_bgp_open(asn: Asn, is_ipv6: bool) -> Vec<u8> {
         caps.push(1); // SAFI=1
     }
 
-    // Capability: Graceful Restart (code 64) - RFC 4724
-    // This signals that End-of-RIB markers will be sent, which is
-    // required for receivers to detect the end of initial table dump.
-    // Flags: 0x0000 (restart state bit = 0, restart time = 0),
-    // followed by AFI/SAFI entries with forwarding bit = 0.
-    caps.push(64); // Capability code
-    let gr_afi_count = if is_ipv6 { 2 } else { 1 };
-    let gr_len = 2 + gr_afi_count * 4; // 2 (restart flags/time) + 4 per AFI/SAFI entry
-    caps.push(gr_len as u8);
-    caps.extend_from_slice(&0u16.to_be_bytes()); // Restart Flags (4 bits) + Restart Time (12 bits) = 0
-    // IPv4 Unicast with forwarding state not preserved
-    caps.extend_from_slice(&1u16.to_be_bytes()); // AFI=1
-    caps.push(1); // SAFI=1
-    caps.push(0); // Flags for this AFI/SAFI
-    if is_ipv6 {
-        // IPv6 Unicast with forwarding state not preserved
-        caps.extend_from_slice(&2u16.to_be_bytes()); // AFI=2
+    if advertise_graceful_restart {
+        // Capability: Graceful Restart (code 64) - RFC 4724.
+        // Advertising this tells receivers to expect matching End-of-RIB
+        // markers for the listed AFI/SAFIs.
+        caps.push(64); // Capability code
+        let gr_afi_count = if include_ipv6 { 2 } else { 1 };
+        let gr_len = 2 + gr_afi_count * 4; // restart flags/time + entries
+        caps.push(gr_len as u8);
+        caps.extend_from_slice(&0u16.to_be_bytes());
+        // IPv4 Unicast with forwarding state not preserved.
+        caps.extend_from_slice(&1u16.to_be_bytes()); // AFI=1
         caps.push(1); // SAFI=1
         caps.push(0); // Flags for this AFI/SAFI
+        if include_ipv6 {
+            // IPv6 Unicast with forwarding state not preserved
+            caps.extend_from_slice(&2u16.to_be_bytes()); // AFI=2
+            caps.push(1); // SAFI=1
+            caps.push(0); // Flags for this AFI/SAFI
+        }
     }
 
     // Optional Parameters: wrap capabilities in Parameter Type 2
@@ -306,11 +310,23 @@ pub fn build_admin_label_json(
 }
 
 /// Build a BMP Peer Up Notification message.
-pub fn build_peer_up(peer: &PeerInfo) -> Vec<u8> {
-    let sent_open =
-        build_bgp_open(peer.peer_asn, peer.peer_address.is_ipv6());
-    let received_open =
-        build_bgp_open(peer.peer_asn, peer.peer_address.is_ipv6());
+pub fn build_peer_up(
+    peer: &PeerInfo,
+    advertise_graceful_restart: bool,
+) -> Vec<u8> {
+    // BMP-out can emit IPv4 and IPv6 unicast route-monitoring messages for a
+    // peer regardless of whether the peer's transport address is IPv4 or IPv6.
+    let include_ipv6 = true;
+    let sent_open = build_bgp_open(
+        peer.peer_asn,
+        include_ipv6,
+        advertise_graceful_restart,
+    );
+    let received_open = build_bgp_open(
+        peer.peer_asn,
+        include_ipv6,
+        advertise_graceful_restart,
+    );
     let max_tlv_len = u16::MAX as usize;
 
     let admin_label = peer
@@ -324,8 +340,12 @@ pub fn build_peer_up(peer: &PeerInfo) -> Vec<u8> {
         None => 0,
     };
 
-    let peer_up_body_len =
-        16 + 2 + 2 + sent_open.len() + received_open.len() + admin_label_tlv_len;
+    let peer_up_body_len = 16
+        + 2
+        + 2
+        + sent_open.len()
+        + received_open.len()
+        + admin_label_tlv_len;
     let total_len =
         BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + peer_up_body_len;
 
@@ -378,11 +398,7 @@ pub fn build_route_monitoring(
         BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + bgp_update.len();
 
     let mut buf = Vec::with_capacity(total_len);
-    write_common_header(
-        &mut buf,
-        BMP_MSG_ROUTE_MONITORING,
-        total_len as u32,
-    );
+    write_common_header(&mut buf, BMP_MSG_ROUTE_MONITORING, total_len as u32);
     write_per_peer_header(&mut buf, peer);
     buf.extend_from_slice(&bgp_update);
 
@@ -482,10 +498,7 @@ fn build_bgp_update(
         buf
     } else {
         // For IPv6: add MP_REACH_NLRI (type 14) with the original next hop
-        let mp_reach = build_mp_reach_nlri(
-            prefix,
-            orig_next_hop.as_deref(),
-        );
+        let mp_reach = build_mp_reach_nlri(prefix, orig_next_hop.as_deref());
         let total_pa_len = pa_bytes.len() + mp_reach.len();
 
         let update_body_len = 2 + 2 + total_pa_len;
@@ -512,7 +525,9 @@ fn build_bgp_update(
 ///
 /// Returns the filtered path attributes and, if found, the next hop bytes
 /// extracted from the original MP_REACH_NLRI (type 14).
-fn filter_raw_path_attributes(pamap: &RotondaPaMap) -> (Vec<u8>, Option<Vec<u8>>) {
+fn filter_raw_path_attributes(
+    pamap: &RotondaPaMap,
+) -> (Vec<u8>, Option<Vec<u8>>) {
     let raw = pamap.as_ref();
     if raw.len() < 2 {
         return (Vec::new(), None);
@@ -634,7 +649,8 @@ fn encode_prefix_nlri(prefix: Prefix) -> Vec<u8> {
 fn build_eor_ipv4(peer: &PeerInfo) -> Vec<u8> {
     // Minimal BGP UPDATE: marker(16) + length(2) + type(1) + withdrawn_len(2) + pa_len(2) = 23
     let bgp_update_len: usize = 23;
-    let total_len = BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + bgp_update_len;
+    let total_len =
+        BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + bgp_update_len;
     let mut buf = Vec::with_capacity(total_len);
     write_common_header(&mut buf, BMP_MSG_ROUTE_MONITORING, total_len as u32);
     write_per_peer_header(&mut buf, peer);
@@ -661,7 +677,8 @@ fn build_eor_mp_unreach(peer: &PeerInfo, afisafi: AfiSafiType) -> Vec<u8> {
     let total_pa_len = mp_unreach.len();
     let update_body_len = 2 + 2 + total_pa_len; // withdrawn_len(2) + pa_len(2) + PA data
     let bgp_update_len = 19 + update_body_len; // BGP header(19) + body
-    let total_len = BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + bgp_update_len;
+    let total_len =
+        BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + bgp_update_len;
     let mut buf = Vec::with_capacity(total_len);
     write_common_header(&mut buf, BMP_MSG_ROUTE_MONITORING, total_len as u32);
     write_per_peer_header(&mut buf, peer);
@@ -698,8 +715,7 @@ fn build_mp_reach_nlri(prefix: Prefix, next_hop: Option<&[u8]>) -> Vec<u8> {
     };
     let next_hop_len = nh.len() as u8;
 
-    let value_len =
-        2 + 1 + 1 + nh.len() + 1 + nlri_bytes.len();
+    let value_len = 2 + 1 + 1 + nh.len() + 1 + nlri_bytes.len();
 
     let mut buf = Vec::new();
     if value_len > 255 {
@@ -760,8 +776,7 @@ mod tests {
         assert_eq!(msg[0], 3); // Version
         assert_eq!(msg[5], 4); // Type = Initiation
 
-        let len =
-            u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
+        let len = u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
         assert_eq!(len as usize, msg.len());
     }
 
@@ -772,8 +787,7 @@ mod tests {
         assert_eq!(msg[0], 3); // Version
         assert_eq!(msg[5], 5); // Type = Termination
 
-        let len =
-            u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
+        let len = u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
         assert_eq!(len as usize, msg.len());
     }
 
@@ -789,13 +803,12 @@ mod tests {
             admin_label: None,
         };
 
-        let msg = build_peer_up(&peer);
+        let msg = build_peer_up(&peer, true);
 
         assert_eq!(msg[0], 3); // Version
         assert_eq!(msg[5], 3); // Type = Peer Up
 
-        let len =
-            u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
+        let len = u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
         assert_eq!(len as usize, msg.len());
     }
 
@@ -816,8 +829,7 @@ mod tests {
         assert_eq!(msg[0], 3); // Version
         assert_eq!(msg[5], 2); // Type = Peer Down
 
-        let len =
-            u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
+        let len = u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
         assert_eq!(len as usize, msg.len());
 
         assert_eq!(*msg.last().unwrap(), 4); // Reason code
@@ -825,11 +837,9 @@ mod tests {
 
     #[test]
     fn test_encode_prefix_nlri_v4() {
-        let prefix = Prefix::new(
-            IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 0)),
-            24,
-        )
-        .unwrap();
+        let prefix =
+            Prefix::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 0)), 24)
+                .unwrap();
 
         let bytes = encode_prefix_nlri(prefix);
         assert_eq!(bytes[0], 24);
@@ -860,7 +870,7 @@ mod tests {
     #[test]
     fn test_bgp_open_contains_graceful_restart() {
         // IPv4-only peer
-        let open = build_bgp_open(Asn::from_u32(65000), false);
+        let open = build_bgp_open(Asn::from_u32(65000), false, true);
         // Find GR capability (code 64) in the capabilities
         let bgp_body = &open[19..]; // skip marker(16) + length(2) + type(1)
         let opt_params_len = bgp_body[9] as usize;
@@ -880,10 +890,13 @@ mod tests {
             }
             pos += 2 + cap_len;
         }
-        assert!(found_gr, "Graceful Restart capability not found in BGP OPEN");
+        assert!(
+            found_gr,
+            "Graceful Restart capability not found in BGP OPEN"
+        );
 
         // IPv6 peer
-        let open_v6 = build_bgp_open(Asn::from_u32(65000), true);
+        let open_v6 = build_bgp_open(Asn::from_u32(65000), true, true);
         let bgp_body = &open_v6[19..];
         let opt_params_len = bgp_body[9] as usize;
         let opt_params = &bgp_body[10..10 + opt_params_len];
@@ -896,6 +909,23 @@ mod tests {
                 // For IPv6: 2 (restart flags/time) + 4*2 (two AFI/SAFIs) = 10
                 assert_eq!(cap_len, 10);
             }
+            pos += 2 + cap_len;
+        }
+    }
+
+    #[test]
+    fn test_bgp_open_can_omit_graceful_restart() {
+        let open = build_bgp_open(Asn::from_u32(65000), true, false);
+        let bgp_body = &open[19..];
+        let opt_params_len = bgp_body[9] as usize;
+        let opt_params = &bgp_body[10..10 + opt_params_len];
+        let caps = &opt_params[2..];
+
+        let mut pos = 0;
+        while pos < caps.len() {
+            let cap_code = caps[pos];
+            let cap_len = caps[pos + 1] as usize;
+            assert_ne!(cap_code, 64);
             pos += 2 + cap_len;
         }
     }
@@ -960,11 +990,11 @@ mod tests {
         // Path Attribute Length
         let pa_len = u16::from_be_bytes([bgp_msg[21], bgp_msg[22]]) as usize;
         assert_eq!(pa_len, 6); // MP_UNREACH_NLRI: flags(1) + type(1) + len(1) + AFI(2) + SAFI(1)
-        // MP_UNREACH_NLRI attribute
+                               // MP_UNREACH_NLRI attribute
         assert_eq!(bgp_msg[23], 0x80); // Flags: Optional
-        assert_eq!(bgp_msg[24], 15);   // Type: MP_UNREACH_NLRI
-        assert_eq!(bgp_msg[25], 3);    // Length: AFI(2) + SAFI(1)
-        // AFI = 2 (IPv6)
+        assert_eq!(bgp_msg[24], 15); // Type: MP_UNREACH_NLRI
+        assert_eq!(bgp_msg[25], 3); // Length: AFI(2) + SAFI(1)
+                                    // AFI = 2 (IPv6)
         assert_eq!(u16::from_be_bytes([bgp_msg[26], bgp_msg[27]]), 2);
         // SAFI = 1 (Unicast)
         assert_eq!(bgp_msg[28], 1);
@@ -1003,7 +1033,11 @@ mod tests {
         assert!(build_admin_label_json(None, None).is_none());
 
         // Placeholder values filtered
-        assert!(build_admin_label_json(Some("no-sysname"), Some("no-sysdesc")).is_none());
+        assert!(build_admin_label_json(
+            Some("no-sysname"),
+            Some("no-sysdesc")
+        )
+        .is_none());
 
         // Name with special characters
         let json = build_admin_label_json(Some(r#"rtr "A""#), None);
@@ -1022,7 +1056,7 @@ mod tests {
             admin_label: Some(r#"{"sysName":"router1"}"#.to_string()),
         };
 
-        let msg = build_peer_up(&peer);
+        let msg = build_peer_up(&peer, true);
 
         assert_eq!(msg[0], 3); // Version
         assert_eq!(msg[5], 3); // Type = Peer Up
@@ -1045,9 +1079,6 @@ mod tests {
             label.len() as u16
         );
         // Value
-        assert_eq!(
-            &msg[tlv_offset + 4..],
-            label.as_bytes()
-        );
+        assert_eq!(&msg[tlv_offset + 4..], label.as_bytes());
     }
 }

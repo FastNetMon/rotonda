@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Instant;
 
 use log::{debug, info, warn};
@@ -9,9 +9,7 @@ use rotonda_store::prefix_record::RouteStatus;
 
 use crate::{
     ingress::{
-        self,
-        http_ng::QueryFilter,
-        IngressId, IngressInfo, IngressType,
+        self, http_ng::QueryFilter, IngressId, IngressInfo, IngressType,
     },
     payload::{Payload, RotondaRoute, Update},
     units::rib_unit::rib::Rib,
@@ -20,7 +18,7 @@ use routecore::bgp::types::AfiSafiType;
 
 use super::{
     bmp_builder::{self, PeerInfo},
-    client_state::ClientState,
+    client_state::{ClientPhase, ClientState},
     metrics::BmpTcpOutMetrics,
     status_reporter::BmpTcpOutStatusReporter,
 };
@@ -50,8 +48,8 @@ fn resolve_admin_label(
 /// 2. Peer Up for ALL active peers
 /// 3. Single RIB walk sending all routes for all peers (interleaved)
 /// 4. End-of-RIB markers for all peers
-/// 5. Transitions client to Live phase
-/// 6. Drains any buffered updates that arrived during dump
+/// 5. Drains any buffered updates that arrived during dump
+/// 6. Transitions client to Live phase
 pub async fn perform_initial_dump(
     client: &Arc<ClientState>,
     rib: &Arc<Rib>,
@@ -59,7 +57,7 @@ pub async fn perform_initial_dump(
     sys_name: &str,
     sys_descr: &str,
     forward_router_info: bool,
-    metrics: &Arc<BmpTcpOutMetrics>,
+    _metrics: &Arc<BmpTcpOutMetrics>,
     status_reporter: &Arc<BmpTcpOutStatusReporter>,
 ) -> bool {
     status_reporter.dump_started(client.remote_addr);
@@ -73,7 +71,9 @@ pub async fn perform_initial_dump(
     // 2. Find active BGP peers (BgpViaBmp, Bgp, and Mrt-replayed types)
     let peers = {
         let mut all_peers = Vec::new();
-        for ingress_type in [IngressType::BgpViaBmp, IngressType::Bgp, IngressType::Mrt] {
+        for ingress_type in
+            [IngressType::BgpViaBmp, IngressType::Bgp, IngressType::Mrt]
+        {
             let type_name = format!("{:?}", ingress_type);
             let filter = QueryFilter {
                 ingress_type: Some(ingress_type),
@@ -102,24 +102,24 @@ pub async fn perform_initial_dump(
     let bytes_before_dump = client.bytes_sent.load(Ordering::Relaxed);
 
     // Build a lookup map: IngressId -> PeerInfo for quick access during RIB walk
-    let mut peer_info_map: HashMap<IngressId, PeerInfo> = HashMap::with_capacity(peers.len());
-    let mut known_ingress_ids: HashSet<IngressId> = HashSet::with_capacity(peers.len());
+    let mut peer_info_map: HashMap<IngressId, PeerInfo> =
+        HashMap::with_capacity(peers.len());
 
     for peer_entry in &peers {
         let ingress_id = peer_entry.ingress_id;
         let info = &peer_entry.ingress_info;
         let mut peer_info = PeerInfo::from_ingress_info(info);
-        peer_info.admin_label = resolve_admin_label(info, ingress_register, forward_router_info);
+        peer_info.admin_label =
+            resolve_admin_label(info, ingress_register, forward_router_info);
 
         // Send Peer Up
-        let peer_up_msg = bmp_builder::build_peer_up(&peer_info);
+        let peer_up_msg = bmp_builder::build_peer_up(&peer_info, true);
         if !client.send_message(peer_up_msg).await {
             return false;
         }
 
         client.add_known_peer(ingress_id).await;
         peer_info_map.insert(ingress_id, peer_info);
-        known_ingress_ids.insert(ingress_id);
     }
 
     info!(
@@ -132,10 +132,6 @@ pub async fn perform_initial_dump(
     // 4. Phase 2: Single RIB walk — send all routes for all peers interleaved
     let rib_walk_start = Instant::now();
     let mut total_routes: usize = 0;
-    // Track which address families each peer has routes for (for End-of-RIB)
-    let mut peer_has_ipv4: HashSet<IngressId> = HashSet::new();
-    let mut peer_has_ipv6: HashSet<IngressId> = HashSet::new();
-
     match rib.iter_all_prefix_records() {
         Ok(prefix_records) => {
             for prefix_record in prefix_records {
@@ -155,19 +151,9 @@ pub async fn perform_initial_dump(
                         None => continue,
                     };
 
-                    // Track address families per peer
-                    if prefix.is_v4() {
-                        peer_has_ipv4.insert(ingress_id);
-                    } else {
-                        peer_has_ipv6.insert(ingress_id);
-                    }
-
                     let pamap = &route_record.meta;
                     let msg = bmp_builder::build_route_monitoring(
-                        peer_info,
-                        prefix,
-                        pamap,
-                        false,
+                        peer_info, prefix, pamap, false,
                     );
                     total_routes += 1;
                     if !client.send_message(msg).await {
@@ -192,7 +178,8 @@ pub async fn perform_initial_dump(
         rib_walk_elapsed.as_secs_f64(),
     );
 
-    // 5. Phase 3: Send End-of-RIB markers for all peers
+    // 5. Phase 3: Send End-of-RIB markers for every AFI/SAFI advertised in
+    // the synthetic Peer Up OPENs. Even an empty table needs an EoR marker.
     for peer_entry in &peers {
         let ingress_id = peer_entry.ingress_id;
         let peer_info = match peer_info_map.get(&ingress_id) {
@@ -200,25 +187,9 @@ pub async fn perform_initial_dump(
             None => continue,
         };
 
-        if peer_has_ipv4.contains(&ingress_id) {
+        for afisafi in [AfiSafiType::Ipv4Unicast, AfiSafiType::Ipv6Unicast] {
             if let Some(msg) =
-                bmp_builder::build_end_of_rib_marker(
-                    peer_info,
-                    AfiSafiType::Ipv4Unicast,
-                )
-            {
-                if !client.send_message(msg).await {
-                    return false;
-                }
-            }
-        }
-
-        if peer_has_ipv6.contains(&ingress_id) {
-            if let Some(msg) =
-                bmp_builder::build_end_of_rib_marker(
-                    peer_info,
-                    AfiSafiType::Ipv6Unicast,
-                )
+                bmp_builder::build_end_of_rib_marker(peer_info, afisafi)
             {
                 if !client.send_message(msg).await {
                     return false;
@@ -227,7 +198,8 @@ pub async fn perform_initial_dump(
         }
     }
 
-    let dump_bytes = client.bytes_sent.load(Ordering::Relaxed) - bytes_before_dump;
+    let dump_bytes =
+        client.bytes_sent.load(Ordering::Relaxed) - bytes_before_dump;
     let dump_elapsed = dump_start.elapsed();
     info!(
         "bmp-out dump for {}: dump complete, {} peers, {} total routes, {:.2} MB in {:.2}s",
@@ -238,7 +210,10 @@ pub async fn perform_initial_dump(
         dump_elapsed.as_secs_f64(),
     );
 
-    // 4. Drain buffered updates
+    // 4. Drain buffered updates while holding the phase write lock. This keeps
+    // updates arriving at dump completion from being buffered after the
+    // one-time drain.
+    let mut phase = client.phase.write().await;
     let buffered = client.take_buffered_updates().await;
     debug!(
         "Draining {} buffered updates for client {}",
@@ -247,13 +222,20 @@ pub async fn perform_initial_dump(
     );
 
     for update in buffered {
-        if !send_update_to_client(client, &update, ingress_register, forward_router_info).await {
+        if !send_update_to_client(
+            client,
+            &update,
+            ingress_register,
+            forward_router_info,
+        )
+        .await
+        {
             return false;
         }
     }
 
     // 5. Transition to Live phase after buffered updates are sent
-    client.set_live().await;
+    *phase = ClientPhase::Live;
     status_reporter.dump_completed(client.remote_addr);
 
     true
@@ -270,11 +252,24 @@ pub async fn send_update_to_client(
 ) -> bool {
     match update {
         Update::Single(payload) => {
-            send_payload_to_client(client, payload, ingress_register, forward_router_info).await
+            send_payload_to_client(
+                client,
+                payload,
+                ingress_register,
+                forward_router_info,
+            )
+            .await
         }
         Update::Bulk(payloads) => {
             for payload in payloads.iter() {
-                if !send_payload_to_client(client, payload, ingress_register, forward_router_info).await {
+                if !send_payload_to_client(
+                    client,
+                    payload,
+                    ingress_register,
+                    forward_router_info,
+                )
+                .await
+                {
                     return false;
                 }
             }
@@ -285,14 +280,27 @@ pub async fn send_update_to_client(
         }
         Update::WithdrawBulk(entries) => {
             for (ingress_id, info) in entries {
-                if !send_peer_down(client, *ingress_id, info.as_ref(), ingress_register).await {
+                if !send_peer_down(
+                    client,
+                    *ingress_id,
+                    info.as_ref(),
+                    ingress_register,
+                )
+                .await
+                {
                     return false;
                 }
             }
             true
         }
         Update::IngressReappeared(ingress_id) => {
-            send_peer_reappeared(client, *ingress_id, ingress_register, forward_router_info).await
+            send_peer_reappeared(
+                client,
+                *ingress_id,
+                ingress_register,
+                forward_router_info,
+            )
+            .await
         }
         _ => {
             // Other update types are ignored for BMP out
@@ -314,8 +322,12 @@ async fn send_payload_to_client(
     if client.register_known_peer_if_absent(ingress_id).await {
         if let Some(info) = ingress_register.get(ingress_id) {
             let mut peer_info = PeerInfo::from_ingress_info(&info);
-            peer_info.admin_label = resolve_admin_label(&info, ingress_register, forward_router_info);
-            let peer_up = bmp_builder::build_peer_up(&peer_info);
+            peer_info.admin_label = resolve_admin_label(
+                &info,
+                ingress_register,
+                forward_router_info,
+            );
+            let peer_up = bmp_builder::build_peer_up(&peer_info, false);
             if !client.send_message(peer_up).await {
                 client.remove_known_peer(ingress_id).await;
                 return false;
@@ -334,8 +346,11 @@ async fn send_payload_to_client(
     };
 
     let is_withdrawal = payload.route_status == RouteStatus::Withdrawn;
-    if let Some(msg) = bmp_builder::build_route_monitoring_from_route(&peer_info, &payload.rx_value, is_withdrawal)
-    {
+    if let Some(msg) = bmp_builder::build_route_monitoring_from_route(
+        &peer_info,
+        &payload.rx_value,
+        is_withdrawal,
+    ) {
         client.send_message(msg).await
     } else {
         true // Skip if we can't build the message
@@ -387,12 +402,13 @@ async fn send_peer_reappeared(
 ) -> bool {
     if let Some(info) = ingress_register.get(ingress_id) {
         let mut peer_info = PeerInfo::from_ingress_info(&info);
-        peer_info.admin_label = resolve_admin_label(&info, ingress_register, forward_router_info);
+        peer_info.admin_label =
+            resolve_admin_label(&info, ingress_register, forward_router_info);
 
         // Only send Peer Up if this peer was not already known.
         if client.register_known_peer_if_absent(ingress_id).await {
             // Send Peer Up
-            let peer_up = bmp_builder::build_peer_up(&peer_info);
+            let peer_up = bmp_builder::build_peer_up(&peer_info, false);
             if !client.send_message(peer_up).await {
                 client.remove_known_peer(ingress_id).await;
                 return false;
