@@ -47,6 +47,12 @@ pub struct Rib {
     roto_package: Option<Arc<RotoPackage>>,
     roto_context: Arc<Mutex<Ctx>>,
     path_attribute_interner: Arc<PathAttributeInterner>,
+    // Serialises calls into `withdraw_for_ingress`. rotonda-store 0.5.0's
+    // `TreeBitMap::update_withdrawn_muis_bmin` has a CAS retry loop that
+    // never reloads its `expected` value, so any concurrent writer that
+    // loses a CAS race livelocks indefinitely. Holding this mutex around
+    // every withdraw guarantees there's only ever one in flight.
+    withdraw_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -66,6 +72,7 @@ impl Rib {
             roto_package,
             roto_context,
             path_attribute_interner: Arc::new(PathAttributeInterner::default()),
+            withdraw_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -215,6 +222,13 @@ impl Rib {
         specific_afisafi: Option<AfiSafiType>,
         retain_withdrawn_attributes: bool,
     ) {
+        // See the `withdraw_lock` field comment for why this is held across
+        // the whole body: rotonda-store 0.5.0's CAS retry loop livelocks
+        // under concurrent writers.
+        let _guard = self.withdraw_lock.lock().unwrap_or_else(|poisoned| {
+            poisoned.into_inner()
+        });
+
         // This signals a withdraw-all-for-peer, because a BGP session
         // was lost or because a BMP PeerDownNotification was
         // received.
@@ -258,14 +272,10 @@ impl Rib {
         match specific_afisafi {
             None => {
                 // Set all address families to withdrawn.
-                // In addition to unicast prefixes, stored in the
-                // store proper, we might need to update other data
-                // structures holding more exotic families.
+                // `mark_mui_as_withdrawn` already covers both v4 and v6 in
+                // the unicast store in a single tree walk.
 
-                //The store seems to lack a 'mark_mui_as_withdrawn'
-                //that handles both v4 and v6 in one go.
-
-                debug!("mark_mui_as_withdrawn on unicast for for {ingress_id}");
+                debug!("mark_mui_as_withdrawn on unicast for {ingress_id}");
                 if let Err(e) = (*self.unicast)
                     .as_ref()
                     .unwrap()
@@ -275,16 +285,6 @@ impl Rib {
                         "failed to mark MUI as withdrawn in unicast rib: {}",
                         e
                     )
-                }
-
-                // XXX TMP try to use the _v4 withdrawn just to test store behavior
-                debug!("mark_mui_as_withdrawn_v4 on unicast for for {ingress_id}");
-                if let Err(e) = (*self.unicast)
-                    .as_ref()
-                    .unwrap()
-                    .mark_mui_as_withdrawn_v4(ingress_id)
-                {
-                    error!("failed to mark MUI as withdrawn for v4: {}", e)
                 }
 
                 if let Err(e) = (*self.multicast)
@@ -527,8 +527,11 @@ impl Rib {
     }
 
     /// Iterate all prefix records in the unicast RIB.
-    /// Each PrefixRecord contains the prefix and all route records (from all peers).
-    /// Note: this includes withdrawn routes; callers should filter by record.status.
+    /// Each PrefixRecord contains the prefix and all non-withdrawn route
+    /// records (from all peers). Withdrawn entries are filtered out at the
+    /// iterator level so callers don't need to skip them, and PrefixRecords
+    /// whose entire meta vec is withdrawn are dropped entirely — keeps the
+    /// returned Vec smaller for large RIBs (relevant on initial BMP dump).
     pub fn iter_all_prefix_records(
         &self,
     ) -> Result<Vec<PrefixRecord<RotondaPaMap>>, String> {
@@ -540,6 +543,14 @@ impl Rib {
         let res: Vec<PrefixRecord<RotondaPaMap>> = store
             .prefixes_iter(guard)
             .flatten()
+            .filter_map(|mut pr| {
+                pr.meta.retain(|r| r.status != RouteStatus::Withdrawn);
+                if pr.meta.is_empty() {
+                    None
+                } else {
+                    Some(pr)
+                }
+            })
             .collect();
 
         debug!(

@@ -454,19 +454,34 @@ impl RibUnitRunner {
         self.rib.load().clone()
     }
 
-    fn signal_withdraw(
+    /// Run `Rib::withdraw_for_ingress` on the blocking pool.
+    ///
+    /// The rotonda-store tree-bitmap walk done by `mark_mui_as_withdrawn`
+    /// allocates and clones roaring bitmap containers across every node it
+    /// touches. On a multi-million-route RIB a single call can take seconds,
+    /// and a peer-down cascade fan-out runs it N times in a row. Doing that
+    /// on a tokio worker stalls bmp-in socket reads and freezes the whole
+    /// pipeline (bmp-in -> rib -> bmp-out) until the cascade finishes.
+    async fn signal_withdraws_blocking(
         &self,
-        ingress_id: ingress::IngressId,
-        specific_afisafi: Option<AfiSafiType>,
+        ids: Vec<(ingress::IngressId, Option<AfiSafiType>)>,
     ) {
-        debug!("signal_withdraw for {ingress_id}");
-        self.rib
-            .load()
-            .withdraw_for_ingress(
-                ingress_id,
-                specific_afisafi,
-                self.retain_withdrawn_attributes.load(Ordering::Relaxed),
-            );
+        if ids.is_empty() {
+            return;
+        }
+        let rib = self.rib.load().clone();
+        let retain = self
+            .retain_withdrawn_attributes
+            .load(Ordering::Relaxed);
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            for (id, afisafi) in ids {
+                rib.withdraw_for_ingress(id, afisafi, retain);
+            }
+        })
+        .await
+        {
+            error!("withdraw blocking task failed: {}", e);
+        }
     }
 
     pub async fn run(
@@ -616,9 +631,9 @@ impl RibUnitRunner {
 
             Update::WithdrawBulk(ref entries) => {
                 debug!("got WithdrawBulk for {} ids", entries.len());
-                entries
-                    .iter()
-                    .for_each(|(id, _info)| self.signal_withdraw(*id, None));
+                let ids: Vec<_> =
+                    entries.iter().map(|(id, _)| (*id, None)).collect();
+                self.signal_withdraws_blocking(ids).await;
                 self.gate.update_data(update).await;
             }
 
@@ -629,7 +644,11 @@ impl RibUnitRunner {
             }
 
             Update::Withdraw(ingress_id, maybe_afisafi) => {
-                self.signal_withdraw(ingress_id, maybe_afisafi);
+                self.signal_withdraws_blocking(vec![(
+                    ingress_id,
+                    maybe_afisafi,
+                )])
+                .await;
                 self.gate.update_data(update).await;
             }
 
