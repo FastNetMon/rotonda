@@ -239,7 +239,9 @@ pub async fn perform_initial_dump(
     // drops we're hunting.
     let mut peer_rows: Vec<(IngressId, &PeerInfo, usize)> = peer_info_map
         .iter()
-        .map(|(id, pi)| (*id, pi, routes_per_ingress.get(id).copied().unwrap_or(0)))
+        .map(|(id, pi)| {
+            (*id, pi, routes_per_ingress.get(id).copied().unwrap_or(0))
+        })
         .collect();
     peer_rows.sort_by_key(|(_, _, count)| std::cmp::Reverse(*count));
     let zero_count = peer_rows.iter().filter(|(_, _, c)| *c == 0).count();

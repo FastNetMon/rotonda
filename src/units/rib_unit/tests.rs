@@ -1,5 +1,7 @@
 use crate::common::status_reporter::AnyStatusReporter;
-use crate::roto_runtime::types::{explode_announcements, explode_withdrawals};
+use crate::roto_runtime::types::{
+    explode_announcements, explode_withdrawals,
+};
 use crate::tests::util::internal::get_testable_metrics_snapshot;
 use crate::{
     bgp::encode::{mk_bgp_update, Announcements, Prefixes},
@@ -65,7 +67,10 @@ async fn process_update_single_route() {
     runner.process_update(update).await.unwrap();
 
     // And it should be added to the route store
-    assert_eq!(runner.rib().store().unwrap().prefixes_count().in_memory(), 1);
+    assert_eq!(
+        runner.rib().store().unwrap().prefixes_count().in_memory(),
+        1
+    );
 
     // And check that recorded metrics are correct
     assert_eq!(query_metrics(&runner.status_reporter()), (1, 0, 1, 0, 1));
@@ -86,7 +91,10 @@ async fn process_update_withdraw_unannounced_route() {
 
     // And it should cause the prefix to be added to the route store
     // LH: errr, it should not?
-    assert_eq!(runner.rib().store().unwrap().prefixes_count().in_memory(), 0);
+    assert_eq!(
+        runner.rib().store().unwrap().prefixes_count().in_memory(),
+        0
+    );
 
     // And check that recorded metrics are correct
     assert_eq!(query_metrics(&runner.status_reporter()), (0, 1, 0, 0, 1));
@@ -96,7 +104,10 @@ async fn process_update_withdraw_unannounced_route() {
     runner.process_update(update).await.unwrap();
 
     // And it should cause the prefix to be added to the route store
-    assert_eq!(runner.rib().store().unwrap().prefixes_count().in_memory(), 1);
+    assert_eq!(
+        runner.rib().store().unwrap().prefixes_count().in_memory(),
+        1
+    );
 
     // And check that recorded metrics are correct
     assert_eq!(query_metrics(&runner.status_reporter()), (0, 2, 0, 0, 1));
@@ -115,14 +126,20 @@ async fn process_update_same_route_twice() {
     runner.process_update(update.clone()).await.unwrap();
 
     // And it should be added to the route store
-    assert_eq!(runner.rib().store().unwrap().prefixes_count().in_memory(), 1);
+    assert_eq!(
+        runner.rib().store().unwrap().prefixes_count().in_memory(),
+        1
+    );
 
     //// When it is processed by this unit again it should not be filtered
     //assert!(!is_filtered(&runner, update).await);
     runner.process_update(update.clone()).await.unwrap();
 
     // And it should NOT be added again to the route store
-    assert_eq!(runner.rib().store().unwrap().prefixes_count().in_memory(), 1);
+    assert_eq!(
+        runner.rib().store().unwrap().prefixes_count().in_memory(),
+        1
+    );
 
     // And check that recorded metrics are correct
     assert_eq!(query_metrics(&runner.status_reporter()), (1, 0, 1, 0, 1));
@@ -135,7 +152,10 @@ async fn process_update_same_route_twice() {
     runner.process_update(update).await.unwrap();
 
     // And it should cause the route to be marked as withdrawn
-    assert_eq!(runner.rib().store().unwrap().prefixes_count().in_memory(), 1);
+    assert_eq!(
+        runner.rib().store().unwrap().prefixes_count().in_memory(),
+        1
+    );
 
     // And check that recorded metrics are correct
     assert_eq!(query_metrics(&runner.status_reporter()), (1, 0, 0, 1, 1));
@@ -195,7 +215,10 @@ async fn process_peer_withdraw_can_drop_attributes() {
         .unwrap();
     assert!(stored_attr_len(&runner, &prefix) > 2);
 
-    runner.process_update(Update::Withdraw(1, None)).await.unwrap();
+    runner
+        .process_update(Update::Withdraw(1, None))
+        .await
+        .unwrap();
 
     assert_eq!(stored_status(&runner, &prefix), RouteStatus::Withdrawn);
     assert_eq!(stored_attr_len(&runner, &prefix), 2);
@@ -784,7 +807,6 @@ fn mk_route_update_with_communities(
     for r in rws {
         bulk.push(Payload::new(r, None, ingress_id, RouteStatus::Active));
     }
-
 
     for w in wdws {
         bulk.push(Payload::new(w, None, ingress_id, RouteStatus::Withdrawn));

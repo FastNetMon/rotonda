@@ -327,9 +327,8 @@ impl BgpTcpInRunner {
             let ingresses = arc_self.ingresses.clone();
             let gate = arc_self.gate.clone();
             crate::tokio::spawn("bgp-in-peer-stats-emitter", async move {
-                let mut iv = tokio::time::interval(Duration::from_secs(
-                    interval_secs,
-                ));
+                let mut iv =
+                    tokio::time::interval(Duration::from_secs(interval_secs));
                 // Consume the immediate first tick so we wait
                 // a full interval before the first emission —
                 // peers usually need a few seconds to come up.
@@ -349,9 +348,8 @@ impl BgpTcpInRunner {
                                         == Some(IngressType::Bgp) => {}
                             _ => continue,
                         }
-                        let body = super::stats_builder::build_stats_body(
-                            &snap,
-                        );
+                        let body =
+                            super::stats_builder::build_stats_body(&snap);
                         gate.update_data(Update::PeerStats {
                             ingress_id: id,
                             body,
@@ -957,7 +955,9 @@ mod tests {
             _child_status_reporter: Arc<BgpTcpInStatusReporter>,
             _live_sessions: Arc<std::sync::Mutex<LiveSessions>>,
             _ingressess: Arc<ingress::Register>,
-            _peer_stats: Arc<crate::ingress::peer_stats::BgpPeerStatsRegistry>,
+            _peer_stats: Arc<
+                crate::ingress::peer_stats::BgpPeerStatsRegistry,
+            >,
             _connector_ingress_id: ingress::IngressId,
         ) {
         }

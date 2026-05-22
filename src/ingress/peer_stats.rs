@@ -77,8 +77,7 @@ impl BgpPeerStats {
         // Mirror the same saturation for the aggregate.
         let agg = self.adj_rib_in_routes.load(Ordering::Relaxed);
         let new_agg = agg.saturating_sub(dec);
-        self.adj_rib_in_routes
-            .store(new_agg, Ordering::Relaxed);
+        self.adj_rib_in_routes.store(new_agg, Ordering::Relaxed);
     }
 
     /// Reset the per-AFI/SAFI Adj-RIB-In gauge to zero, e.g. on

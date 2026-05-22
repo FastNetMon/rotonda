@@ -638,8 +638,12 @@ fn normalize_mrt_mp_reach(
         let mut buf = Vec::with_capacity(1 + num_bytes);
         buf.push(prefix_len);
         match prefix.addr() {
-            std::net::IpAddr::V4(v4) => buf.extend_from_slice(&v4.octets()[..num_bytes]),
-            std::net::IpAddr::V6(v6) => buf.extend_from_slice(&v6.octets()[..num_bytes]),
+            std::net::IpAddr::V4(v4) => {
+                buf.extend_from_slice(&v4.octets()[..num_bytes])
+            }
+            std::net::IpAddr::V6(v6) => {
+                buf.extend_from_slice(&v6.octets()[..num_bytes])
+            }
         }
         buf
     };
@@ -659,7 +663,8 @@ fn normalize_mrt_mp_reach(
                 break;
             }
             (
-                ((raw_attr[pos + 2] as usize) << 8) | (raw_attr[pos + 3] as usize),
+                ((raw_attr[pos + 2] as usize) << 8)
+                    | (raw_attr[pos + 3] as usize),
                 4,
             )
         } else {
@@ -691,7 +696,9 @@ fn normalize_mrt_mp_reach(
                     out.push(new_flags);
                     out.push(14);
                     if use_extended {
-                        out.extend_from_slice(&(new_value_len as u16).to_be_bytes());
+                        out.extend_from_slice(
+                            &(new_value_len as u16).to_be_bytes(),
+                        );
                     } else {
                         out.push(new_value_len as u8);
                     }

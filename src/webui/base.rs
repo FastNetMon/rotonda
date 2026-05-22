@@ -1070,21 +1070,18 @@ impl crate::units::rib_unit::rib::SearchResult {
     ) -> Vec<RouteDetails> {
         routes
             .map(|m| {
-                let route_ingress_info =
-                    self.ingress_register.get(m.multi_uniq_id);
+                let route_ingress_info = self.ingress_info(m.multi_uniq_id);
                 let bmp_router = self
-                    .ingress_register
-                    .get(m.multi_uniq_id)
+                    .ingress_info(m.multi_uniq_id)
                     .and_then(|info| info.parent_ingress)
                     .and_then(|parent_id| {
-                        self.ingress_register
-                            .get(parent_id)
+                        self.ingress_info(parent_id)
                             .filter(|parent_info| {
                                 parent_info.ingress_type
                                     == Some(IngressType::Bmp)
                             })
                             .map(|parent_info| {
-                                BmpRouter::new(parent_id, parent_info)
+                                BmpRouter::new(parent_id, parent_info.clone())
                             })
                     });
 
@@ -1094,10 +1091,8 @@ impl crate::units::rib_unit::rib::SearchResult {
                 RouteDetails {
                     bmp_router,
                     peer_asn: route_ingress_info
-                        .as_ref()
                         .and_then(|info| info.remote_asn),
                     ribview: route_ingress_info
-                        .as_ref()
                         .and_then(|info| info.peer_rib_type),
                     origin_asn: aspath
                         .as_ref()

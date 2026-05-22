@@ -310,7 +310,8 @@ impl RouterHandler {
         for id in &session_ids {
             ingress_register.update_info(
                 *id,
-                ingress::IngressInfo::new().with_state(IngressState::Disconnected),
+                ingress::IngressInfo::new()
+                    .with_state(IngressState::Disconnected),
             );
         }
         let entries: smallvec::SmallVec<

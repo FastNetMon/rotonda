@@ -19,12 +19,25 @@ use rotonda_store::{
     stats::UpsertReport,
 };
 use routecore::bgp::{
-    aspath::HopPath, nlri::afisafi::{IsPrefix, Nlri}, path_attributes::PaMap, path_selection::{OrdRoute, Rfc4271, TiebreakerInfo}, types::{AfiSafiType, Otc}
+    aspath::HopPath,
+    nlri::afisafi::{IsPrefix, Nlri},
+    path_attributes::PaMap,
+    path_selection::{OrdRoute, Rfc4271, TiebreakerInfo},
+    types::{AfiSafiType, Otc},
 };
-use serde::{ser::{SerializeSeq, SerializeStruct}, Serialize, Serializer};
+use serde::{
+    ser::{SerializeSeq, SerializeStruct},
+    Serialize, Serializer,
+};
 
 use crate::{
-    ingress::{self, register::{IdAndInfo, OwnedIdAndInfo}, IngressId, IngressInfo}, payload::{PathAttributeInterner, RotondaPaMap, RotondaPaMapWithQueryFilter, RotondaRoute, RouterId}, representation::{GenOutput, Json}, roto_runtime::{types::{RotoPackage}, Ctx}
+    ingress::{self, register::IdAndInfo, IngressId, IngressInfo},
+    payload::{
+        PathAttributeInterner, RotondaPaMap, RotondaPaMapWithQueryFilter,
+        RotondaRoute, RouterId,
+    },
+    representation::{GenOutput, Json},
+    roto_runtime::{types::RotoPackage, Ctx},
 };
 
 use super::{http_ng::Include, QueryFilter};
@@ -33,7 +46,9 @@ type Store = StarCastRib<RotondaPaMap, MemoryOnlyConfig>;
 
 type RotoHttpFilter = roto::TypedFunc<
     Ctx,
-    fn (roto::Val<crate::roto_runtime::RcRotondaPaMap>,) -> roto::Verdict<(), ()>,
+    fn(
+        roto::Val<crate::roto_runtime::RcRotondaPaMap>,
+    ) -> roto::Verdict<(), ()>,
 >;
 
 #[derive(Clone)]
@@ -73,7 +88,9 @@ impl Rib {
             ingress_register,
             roto_package,
             roto_context,
-            path_attribute_interner: Arc::new(PathAttributeInterner::default()),
+            path_attribute_interner: Arc::new(
+                PathAttributeInterner::default(),
+            ),
             withdraw_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -227,9 +244,10 @@ impl Rib {
         // See the `withdraw_lock` field comment for why this is held across
         // the whole body: rotonda-store 0.5.0's CAS retry loop livelocks
         // under concurrent writers.
-        let _guard = self.withdraw_lock.lock().unwrap_or_else(|poisoned| {
-            poisoned.into_inner()
-        });
+        let _guard = self
+            .withdraw_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // This signals a withdraw-all-for-peer, because a BGP session
         // was lost or because a BMP PeerDownNotification was
@@ -409,28 +427,32 @@ impl Rib {
 
         let guard = &epoch::pin();
         let prefixes = match specific_afisafi {
-            Some(AfiSafiType::Ipv4Unicast | AfiSafiType::Ipv4Multicast) => store
-                .prefixes_iter_v4(guard)
-                .flatten()
-                .filter(|prefix_record| {
-                    prefix_record
-                        .meta
-                        .iter()
-                        .any(|record| record.multi_uniq_id == ingress_id)
-                })
-                .map(|prefix_record| prefix_record.prefix)
-                .collect::<Vec<_>>(),
-            Some(AfiSafiType::Ipv6Unicast | AfiSafiType::Ipv6Multicast) => store
-                .prefixes_iter_v6(guard)
-                .flatten()
-                .filter(|prefix_record| {
-                    prefix_record
-                        .meta
-                        .iter()
-                        .any(|record| record.multi_uniq_id == ingress_id)
-                })
-                .map(|prefix_record| prefix_record.prefix)
-                .collect::<Vec<_>>(),
+            Some(AfiSafiType::Ipv4Unicast | AfiSafiType::Ipv4Multicast) => {
+                store
+                    .prefixes_iter_v4(guard)
+                    .flatten()
+                    .filter(|prefix_record| {
+                        prefix_record
+                            .meta
+                            .iter()
+                            .any(|record| record.multi_uniq_id == ingress_id)
+                    })
+                    .map(|prefix_record| prefix_record.prefix)
+                    .collect::<Vec<_>>()
+            }
+            Some(AfiSafiType::Ipv6Unicast | AfiSafiType::Ipv6Multicast) => {
+                store
+                    .prefixes_iter_v6(guard)
+                    .flatten()
+                    .filter(|prefix_record| {
+                        prefix_record
+                            .meta
+                            .iter()
+                            .any(|record| record.multi_uniq_id == ingress_id)
+                    })
+                    .map(|prefix_record| prefix_record.prefix)
+                    .collect::<Vec<_>>()
+            }
             _ => store
                 .prefixes_iter(guard)
                 .flatten()
@@ -460,46 +482,43 @@ impl Rib {
         }
     }
 
-    pub fn mark_ingress_active(
-        &self,
-        ingress_id: IngressId,
-    ) {
+    pub fn mark_ingress_active(&self, ingress_id: IngressId) {
         // Same hazard as `withdraw_for_ingress`: `mark_mui_as_active_*`
         // walks `update_withdrawn_muis_bmin`, whose CAS retry loop
         // livelocks under concurrent writers. Serialise with the
         // withdraw path.
-        let _guard = self.withdraw_lock.lock().unwrap_or_else(|poisoned| {
-            poisoned.into_inner()
-        });
+        let _guard = self
+            .withdraw_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Err(e) = (*self.unicast)
             .as_ref()
-                .unwrap()
-                .mark_mui_as_active_v4(ingress_id)
+            .unwrap()
+            .mark_mui_as_active_v4(ingress_id)
         {
             error!("failed to mark MUI as active in unicast v4 rib: {e}")
         }
         if let Err(e) = (*self.unicast)
             .as_ref()
-                .unwrap()
-                .mark_mui_as_active_v6(ingress_id)
+            .unwrap()
+            .mark_mui_as_active_v6(ingress_id)
         {
             error!("failed to mark MUI as active in unicast v6 rib: {e}")
         }
         if let Err(e) = (*self.multicast)
             .as_ref()
-                .unwrap()
-                .mark_mui_as_active_v4(ingress_id)
+            .unwrap()
+            .mark_mui_as_active_v4(ingress_id)
         {
             error!("failed to mark MUI as active in multicast v4 rib: {e}")
         }
         if let Err(e) = (*self.multicast)
             .as_ref()
-                .unwrap()
-                .mark_mui_as_active_v6(ingress_id)
+            .unwrap()
+            .mark_mui_as_active_v6(ingress_id)
         {
             error!("failed to mark MUI as active in multicast v6 rib: {e}")
         }
-
     }
 
     pub fn match_prefix(
@@ -562,10 +581,7 @@ impl Rib {
             })
             .collect();
 
-        debug!(
-            "rib::iter_all_prefix_records: {} prefix records",
-            res.len()
-        );
+        debug!("rib::iter_all_prefix_records: {} prefix records", res.len());
         Ok(res)
     }
 
@@ -606,7 +622,6 @@ impl Rib {
         Ok(res)
     }
 
-
     //
     // new methods returning results to be used by both HTTP API and CLI, i.e. types that will need
     // impls for ToJson and ToCli so they can be impl OutputFormat
@@ -621,19 +636,16 @@ impl Rib {
         //nlri: Nlri<&[u8]>,
         nlri: Prefix, // change to Nlri or equivalent after routecore refactor
         filter: QueryFilter,
-    //) -> Result<QueryResult<RotondaPaMap>, String> {
+        //) -> Result<QueryResult<RotondaPaMap>, String> {
     ) -> Result<SearchResult, String> {
         let guard = &epoch::pin();
 
         let store = match afisafi {
-            AfiSafiType::Ipv4Unicast |
-            AfiSafiType::Ipv6Unicast => {
-                (*self.unicast)
-                    .as_ref()
-                    .ok_or(PrefixStoreError::StoreNotReadyError.to_string())?
-                }
-            AfiSafiType::Ipv4Multicast |
-            AfiSafiType::Ipv6Multicast => {
+            AfiSafiType::Ipv4Unicast | AfiSafiType::Ipv6Unicast => (*self
+                .unicast)
+                .as_ref()
+                .ok_or(PrefixStoreError::StoreNotReadyError.to_string())?,
+            AfiSafiType::Ipv4Multicast | AfiSafiType::Ipv6Multicast => {
                 (*self.multicast)
                     .as_ref()
                     .ok_or(PrefixStoreError::StoreNotReadyError.to_string())?
@@ -646,10 +658,15 @@ impl Rib {
         let match_options = &MatchOptions {
             match_type: rotonda_store::match_options::MatchType::ExactMatch,
             include_withdrawn: false,
-            include_less_specifics: filter.include.contains(&Include::LessSpecifics),
-            include_more_specifics: filter.include.contains(&Include::MoreSpecifics),
+            include_less_specifics: filter
+                .include
+                .contains(&Include::LessSpecifics),
+            include_more_specifics: filter
+                .include
+                .contains(&Include::MoreSpecifics),
             mui: filter.ingress_id,
-            include_history: rotonda_store::match_options::IncludeHistory::None,
+            include_history:
+                rotonda_store::match_options::IncludeHistory::None,
         };
 
         debug!("match_options.mui: {:?}", match_options.mui);
@@ -657,7 +674,13 @@ impl Rib {
         let t0 = std::time::Instant::now();
         let mut res = store
             .match_prefix(&nlri, match_options, guard)
-            .map(|res| SearchResult { query_result: res, ingress_register: self.ingress_register.clone(), query_filter: filter.clone() } )
+            .map(|res| {
+                SearchResult::new(
+                    res,
+                    self.ingress_register.clone(),
+                    filter.clone(),
+                )
+            })
             .map_err(|err| err.to_string());
 
         // filter on:
@@ -670,8 +693,10 @@ impl Rib {
         // - large community
         // - peer distinguisher
 
-        debug!("store lookup took {:?}", std::time::Instant::now().duration_since(t0));
-
+        debug!(
+            "store lookup took {:?}",
+            std::time::Instant::now().duration_since(t0)
+        );
 
         // Find the roto function from the compiled Roto Package.
         // We do this here, once, to reduce acquiring locks and such over and over.
@@ -686,55 +711,84 @@ impl Rib {
         //});
 
         // Alternatively, we could return an error:
-        let maybe_roto_function: Option<RotoHttpFilter> = match filter.roto_function.as_ref() {
+        let maybe_roto_function: Option<RotoHttpFilter> = match filter
+            .roto_function
+            .as_ref()
+        {
             Some(name) => {
                 debug!("looking up {name} in compiled roto package");
-                if let Some(f) = self.roto_package.as_ref().and_then(|package| {
-                    let mut package = package.lock().unwrap();
-                    package.get_function(name.as_str()).ok()
-                }) {
+                if let Some(f) =
+                    self.roto_package.as_ref().and_then(|package| {
+                        let mut package = package.lock().unwrap();
+                        package.get_function(name.as_str()).ok()
+                    })
+                {
                     Some(f)
                 } else {
                     error!("query for undefined roto filter");
                     return Err(format!("no roto function '{name}' defined"));
                 }
             }
-            None => None
+            None => None,
         };
-
-
-
 
         let t0 = std::time::Instant::now();
 
         let _ = res.as_mut().map(|sr| {
-            self.apply_filter(&mut sr.query_result.records, &filter, maybe_roto_function.clone());
+            self.apply_filter(
+                &mut sr.query_result.records,
+                &filter,
+                maybe_roto_function.clone(),
+                &sr.ingress_info,
+            );
             if let Some(rs) = sr.query_result.more_specifics.as_mut() {
-                rs.v4.retain_mut(|pr|{
-                    self.apply_filter(&mut pr.meta, &filter, maybe_roto_function.clone());
+                rs.v4.retain_mut(|pr| {
+                    self.apply_filter(
+                        &mut pr.meta,
+                        &filter,
+                        maybe_roto_function.clone(),
+                        &sr.ingress_info,
+                    );
                     !pr.meta.is_empty()
                 });
-                rs.v6.retain_mut(|pr|{
-                    self.apply_filter(&mut pr.meta, &filter, maybe_roto_function.clone());
+                rs.v6.retain_mut(|pr| {
+                    self.apply_filter(
+                        &mut pr.meta,
+                        &filter,
+                        maybe_roto_function.clone(),
+                        &sr.ingress_info,
+                    );
                     !pr.meta.is_empty()
                 });
             }
             if let Some(rs) = sr.query_result.less_specifics.as_mut() {
-                rs.v4.retain_mut(|pr|{
-                    self.apply_filter(&mut pr.meta, &filter, maybe_roto_function.clone());
+                rs.v4.retain_mut(|pr| {
+                    self.apply_filter(
+                        &mut pr.meta,
+                        &filter,
+                        maybe_roto_function.clone(),
+                        &sr.ingress_info,
+                    );
                     !pr.meta.is_empty()
                 });
-                rs.v6.retain_mut(|pr|{
-                    self.apply_filter(&mut pr.meta, &filter, maybe_roto_function.clone());
+                rs.v6.retain_mut(|pr| {
+                    self.apply_filter(
+                        &mut pr.meta,
+                        &filter,
+                        maybe_roto_function.clone(),
+                        &sr.ingress_info,
+                    );
                     !pr.meta.is_empty()
                 });
             }
         });
 
-        debug!("filtering took {:?}", std::time::Instant::now().duration_since(t0));
+        debug!(
+            "filtering took {:?}",
+            std::time::Instant::now().duration_since(t0)
+        );
 
         res
-
     }
 
     // XXX:
@@ -744,35 +798,45 @@ impl Rib {
     //  - fetch the required info once, pass it into apply_filter
     //  - in apply_filter, check for such info and branch: if let Some(passed_info), etc
 
-    fn apply_filter(&self, records: &mut Vec<Record<RotondaPaMap>>, filter: &QueryFilter, roto_filter: Option<RotoHttpFilter>) {
+    fn apply_filter(
+        &self,
+        records: &mut Vec<Record<RotondaPaMap>>,
+        filter: &QueryFilter,
+        roto_filter: Option<RotoHttpFilter>,
+        ingress_info: &HashMap<IngressId, IngressInfo>,
+    ) {
         if let Some(rib_type) = filter.rib_type {
-            records.retain(|r|{
-                self.ingress_register.get(r.multi_uniq_id).map(|ii|
-                    ii.peer_rib_type == Some(rib_type)
-                ).unwrap_or(true)
+            records.retain(|r| {
+                ingress_info
+                    .get(&r.multi_uniq_id)
+                    .map(|ii| ii.peer_rib_type == Some(rib_type))
+                    .unwrap_or(true)
             });
         }
 
         if let Some(peer_asn) = filter.peer_asn {
-            records.retain(|r|{
-                self.ingress_register.get(r.multi_uniq_id).map(|ii|
-                    ii.remote_asn == Some(peer_asn)
-                ).unwrap_or(true)
+            records.retain(|r| {
+                ingress_info
+                    .get(&r.multi_uniq_id)
+                    .map(|ii| ii.remote_asn == Some(peer_asn))
+                    .unwrap_or(true)
             });
         }
 
         if let Some(peer_addr) = filter.peer_addr {
-            records.retain(|r|{
-                self.ingress_register.get(r.multi_uniq_id).map(|ii|
-                    ii.remote_addr == Some(peer_addr)
-                ).unwrap_or(true)
+            records.retain(|r| {
+                ingress_info
+                    .get(&r.multi_uniq_id)
+                    .map(|ii| ii.remote_addr == Some(peer_addr))
+                    .unwrap_or(true)
             });
         }
 
         if let Some(f) = roto_filter {
             let mut ctx = self.roto_context.lock().unwrap();
             records.retain_mut(|r| {
-                let rc_r: crate::roto_runtime::RcRotondaPaMap = std::mem::take(&mut r.meta).into();
+                let rc_r: crate::roto_runtime::RcRotondaPaMap =
+                    std::mem::take(&mut r.meta).into();
                 match f.call(&mut ctx, roto::Val(rc_r.clone())) {
                     roto::Verdict::Accept(_) => {
                         r.meta = std::rc::Rc::into_inner(rc_r).unwrap();
@@ -784,14 +848,13 @@ impl Rib {
                     }
                 }
             });
-
         }
 
-        if filter.origin_asn.is_some() ||
-            filter.otc.is_some() ||
-            filter.community.is_some() ||
-            filter.large_community.is_some() ||
-            filter.rov_status.is_some()
+        if filter.origin_asn.is_some()
+            || filter.otc.is_some()
+            || filter.community.is_some()
+            || filter.large_community.is_some()
+            || filter.rov_status.is_some()
         {
             records.retain(|r| {
                 if let Some(rov_status) = filter.rov_status {
@@ -837,7 +900,6 @@ impl Rib {
             // - communities
             // - large communities
             // - route distinguisher
-
         }
     }
 
@@ -849,12 +911,13 @@ impl Rib {
         nlri: Prefix, // change to Nlri or equivalent after routecore refactor
         filter: QueryFilter,
     ) -> Result<(), String>
-        where SearchResult: GenOutput<T>
+    where
+        SearchResult: GenOutput<T>,
     {
         match self.search_routes(afisafi, nlri, filter) {
             Ok(search_results) => {
                 let _ = search_results.write(&mut target);
-            },
+            }
             Err(e) => {
                 error!("error in search_and_output_routes: {e}");
                 return Err(format!("store error: {e}"));
@@ -869,7 +932,7 @@ impl Rib {
         _afisafi: AfiSafiType,
         _nlri: Nlri<&[u8]>,
         _ingress_id: IngressId,
-        _match_options: MatchOptions
+        _match_options: MatchOptions,
     ) -> Result<SearchResult, String> {
         todo!()
     }
@@ -878,7 +941,7 @@ impl Rib {
     pub fn search_routes_for_origin_as(
         _afisafi: AfiSafiType,
         _origin_as: Asn,
-        _match_options: MatchOptions
+        _match_options: MatchOptions,
     ) -> Result<SearchResult, String> {
         todo!()
     }
@@ -890,18 +953,44 @@ impl Rib {
 /// between CLI, HTTP API, etc.
 pub struct SearchResult {
     pub(crate) query_result: QueryResult<RotondaPaMap>,
-    pub(crate) ingress_register: Arc<ingress::Register>,
+    pub(crate) ingress_info: HashMap<IngressId, IngressInfo>,
     query_filter: QueryFilter,
 }
 
 crate::genoutput_json!(SearchResult);
+
+impl SearchResult {
+    fn new(
+        query_result: QueryResult<RotondaPaMap>,
+        ingress_register: Arc<ingress::Register>,
+        query_filter: QueryFilter,
+    ) -> Self {
+        Self {
+            query_result,
+            ingress_info: ingress_register.cloned_info(),
+            query_filter,
+        }
+    }
+
+    pub(crate) fn ingress_info(
+        &self,
+        ingress_id: IngressId,
+    ) -> Option<&IngressInfo> {
+        self.ingress_info.get(&ingress_id)
+    }
+
+    fn id_and_info(&self, ingress_id: IngressId) -> Option<IdAndInfo<'_>> {
+        self.ingress_info
+            .get(&ingress_id)
+            .map(|info| (ingress_id, info).into())
+    }
+}
 
 impl Serialize for SearchResult {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-
         // TODO:
         // - ingress data (include in Arc<Register> in SearchResults wrapper?
         // X rpki rov status
@@ -958,11 +1047,11 @@ impl Serialize for SearchResult {
         //
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
-        struct IncludedData<'a, 'b, 'c> {
+        struct IncludedData<'a, 'b> {
             #[serde(skip_serializing_if = "Option::is_none")]
-            more_specifics: Option<RecordSetWrapper<'a, 'b, 'c>>,
+            more_specifics: Option<RecordSetWrapper<'a, 'b>>,
             #[serde(skip_serializing_if = "Option::is_none")]
-            less_specifics: Option<RecordSetWrapper<'a, 'b, 'c>>,
+            less_specifics: Option<RecordSetWrapper<'a, 'b>>,
         }
 
         let mut root = serializer.serialize_struct("nlri", 3)?;
@@ -973,56 +1062,72 @@ impl Serialize for SearchResult {
         // - time to serialize to json? (is that possible? or should meta then be at the end of the
         //   response perhaps?)
         root.serialize_field("meta", &None::<String>)?;
-        root.serialize_field("data", &Data {
-            nlri: self.query_result.prefix,
-            routes: RecordsWrapper(&self.query_result.records, &self.ingress_register, &self.query_filter),
-        })?;
+        root.serialize_field(
+            "data",
+            &Data {
+                nlri: self.query_result.prefix,
+                routes: RecordsWrapper(&self.query_result.records, self),
+            },
+        )?;
 
-        root.serialize_field("included",
+        root.serialize_field(
+            "included",
             &IncludedData {
-                more_specifics: self.query_result.more_specifics.as_ref().map(|s| RecordSetWrapper(s, &self.ingress_register, &self.query_filter)),
-                less_specifics: self.query_result.less_specifics.as_ref().map(|s| RecordSetWrapper(s, &self.ingress_register, &self.query_filter)),
-
-            }
+                more_specifics: self
+                    .query_result
+                    .more_specifics
+                    .as_ref()
+                    .map(|s| RecordSetWrapper(s, self)),
+                less_specifics: self
+                    .query_result
+                    .less_specifics
+                    .as_ref()
+                    .map(|s| RecordSetWrapper(s, self)),
+            },
         )?;
         root.end()
-
     }
 }
 
 #[derive(Serialize)]
-struct Data<'a, 'b, 'c> {
+struct Data<'a, 'b> {
     nlri: Option<Prefix>,
-    routes: RecordsWrapper<'a, 'b, 'c>,
+    routes: RecordsWrapper<'a, 'b>,
 }
 
-struct RecordsWrapper<'a, 'b, 'c>(&'a Vec<Record<RotondaPaMap>>, &'b Arc<ingress::Register>, &'c QueryFilter);
-struct RecordWrapper<'a, 'b, 'c>(&'a Record<RotondaPaMap>, &'b Arc<ingress::Register>, &'c QueryFilter);
-struct RecordSetWrapper<'a, 'b, 'c>(&'a RecordSet<RotondaPaMap>, &'b Arc<ingress::Register>, &'c QueryFilter);
-struct PrefixRecordWrapper<'a, 'b, 'c>(&'a PrefixRecord<RotondaPaMap>, &'b Arc<ingress::Register>, &'c QueryFilter);
+struct RecordsWrapper<'a, 'b>(
+    &'a Vec<Record<RotondaPaMap>>,
+    &'b SearchResult,
+);
+struct RecordWrapper<'a, 'b>(&'a Record<RotondaPaMap>, &'b SearchResult);
+struct RecordSetWrapper<'a, 'b>(
+    &'a RecordSet<RotondaPaMap>,
+    &'b SearchResult,
+);
+struct PrefixRecordWrapper<'a, 'b>(
+    &'a PrefixRecord<RotondaPaMap>,
+    &'b SearchResult,
+);
 struct RouteStatusWrapper(RouteStatus);
 
-impl Serialize for RecordsWrapper<'_, '_, '_> {
+impl Serialize for RecordsWrapper<'_, '_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-
         let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
         for e in self.0.iter() {
-            seq.serialize_element(&RecordWrapper(e, self.1, self.2))?;
+            seq.serialize_element(&RecordWrapper(e, self.1))?;
         }
         seq.end()
-
     }
 }
 
-impl Serialize for RecordWrapper<'_, '_, '_> {
+impl Serialize for RecordWrapper<'_, '_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-
         // The RPKI information is stored in the value (so, RotondaPaMap) in the store.
         // The RotondaPaMap serializes to { rpki: {}, pathAttributes: [] },
         // so with serde(flatten) the wrapped store::Record serializes to
@@ -1030,20 +1135,20 @@ impl Serialize for RecordWrapper<'_, '_, '_> {
         // on 'one level'.
         //
         #[derive(Serialize)]
-        struct Helper<'a> {
+        struct Helper<'a, 'b> {
             status: RouteStatusWrapper,
-            ingress: OwnedIdAndInfo,
+            ingress: Option<IdAndInfo<'b>>,
             #[serde(flatten)]
             pamap: &'a RotondaPaMap,
             //pamap: RotondaPaMapWithQueryFilter<'a, 'b>,//(&RotondaPaMap, &self.2),
         }
 
         #[derive(Serialize)]
-        struct HelperWithQueryFilter<'a, 'b> {
+        struct HelperWithQueryFilter<'a, 'b, 'c> {
             status: RouteStatusWrapper,
-            ingress: OwnedIdAndInfo,
+            ingress: Option<IdAndInfo<'b>>,
             #[serde(flatten)]
-            pamap: RotondaPaMapWithQueryFilter<'a, 'b>,//(&RotondaPaMap, &self.2),
+            pamap: RotondaPaMapWithQueryFilter<'a, 'c>, //(&RotondaPaMap, &self.2),
         }
 
         // Possible optimisation: lift this wrapping (and thus branching up) into RecordsWrapper or
@@ -1054,55 +1159,62 @@ impl Serialize for RecordWrapper<'_, '_, '_> {
         // - Default case, not specified, so we only filter out typecodes 14 and 15 (MP
         // REACH/UNREACH) while those are stored. After the refactoring of routecore et al and we
         // are sure 14/15 do not end up in the store, that .filter can be removed completely.
-        if self.2.fields_path_attributes.is_some() {
+        let query_filter = &self.1.query_filter;
+        if query_filter.fields_path_attributes.is_some() {
             HelperWithQueryFilter {
-                ingress: self.1.get_tuple(self.0.multi_uniq_id).unwrap(),
+                ingress: self.1.id_and_info(self.0.multi_uniq_id),
                 status: RouteStatusWrapper(self.0.status),
-                pamap: RotondaPaMapWithQueryFilter(&self.0.meta, self.2),
-            }.serialize(serializer)
+                pamap: RotondaPaMapWithQueryFilter(
+                    &self.0.meta,
+                    query_filter,
+                ),
+            }
+            .serialize(serializer)
         } else {
             Helper {
-                ingress: self.1.get_tuple(self.0.multi_uniq_id).unwrap(),
+                ingress: self.1.id_and_info(self.0.multi_uniq_id),
                 status: RouteStatusWrapper(self.0.status),
-                pamap: &self.0.meta
-            }.serialize(serializer)
-
+                pamap: &self.0.meta,
+            }
+            .serialize(serializer)
         }
     }
 }
 
-impl Serialize for RecordSetWrapper<'_, '_, '_> {
+impl Serialize for RecordSetWrapper<'_, '_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: Serializer {
-            let mut s = serializer.serialize_seq(Some(self.0.len()))?;
-            for e in &self.0.v4 {
-               s.serialize_element(&PrefixRecordWrapper(e, self.1, self.2))?;
-            }
-            for e in &self.0.v6 {
-               s.serialize_element(&PrefixRecordWrapper(e, self.1, self.2))?;
-            }
-       s.end()
+        S: Serializer,
+    {
+        let mut s = serializer.serialize_seq(Some(self.0.len()))?;
+        for e in &self.0.v4 {
+            s.serialize_element(&PrefixRecordWrapper(e, self.1))?;
+        }
+        for e in &self.0.v6 {
+            s.serialize_element(&PrefixRecordWrapper(e, self.1))?;
+        }
+        s.end()
     }
 }
 
-impl Serialize for PrefixRecordWrapper<'_, '_, '_> {
+impl Serialize for PrefixRecordWrapper<'_, '_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: Serializer {
-
-             Data {
-                nlri: Some(self.0.prefix),
-                routes: RecordsWrapper(&self.0.meta, self.1, self.2),
-            }.serialize(serializer)
-
+        S: Serializer,
+    {
+        Data {
+            nlri: Some(self.0.prefix),
+            routes: RecordsWrapper(&self.0.meta, self.1),
+        }
+        .serialize(serializer)
     }
 }
 
 impl Serialize for RouteStatusWrapper {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: Serializer {
+        S: Serializer,
+    {
         match self.0 {
             RouteStatus::Active => serializer.serialize_str("active"),
             RouteStatus::InActive => serializer.serialize_str("inactive"),
@@ -1110,8 +1222,6 @@ impl Serialize for RouteStatusWrapper {
         }
     }
 }
-
-
 
 #[derive(Debug)]
 pub enum StoreInsertionEffect {
@@ -1121,8 +1231,6 @@ pub enum StoreInsertionEffect {
     RouteAdded,
     RouteUpdated,
 }
-
-
 
 // --- Tests ----------------------------------------------------------------------------------------------------------
 
