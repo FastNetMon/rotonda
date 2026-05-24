@@ -257,6 +257,29 @@ impl BmpState {
             BmpState::_Aborted(_, _) => None,
         }
     }
+
+    /// Run `PeerStates::disconnect_into_register` for the current state.
+    /// Returns empty for states that hold no peers (Initiating, Terminated,
+    /// _Aborted). Terminated is intentionally empty: the terminate() handlers
+    /// in Dumping/Updating already ran this cleanup before transitioning, so
+    /// calling it again from the TCP-drop path in router_handler would be a
+    /// no-op on an empty map.
+    pub fn disconnect_into_register(
+        &self,
+        register: &ingress::Register,
+    ) -> Vec<(ingress::IngressId, Option<ingress::IngressInfo>)> {
+        match self {
+            BmpState::Dumping(v) => {
+                v.details.peer_states.disconnect_into_register(register)
+            }
+            BmpState::Updating(v) => {
+                v.details.peer_states.disconnect_into_register(register)
+            }
+            BmpState::Initiating(_)
+            | BmpState::Terminated(_)
+            | BmpState::_Aborted(_, _) => Vec::new(),
+        }
+    }
 }
 
 impl<T> std::hash::Hash for BmpStateDetails<T>
@@ -1373,6 +1396,41 @@ impl PeerStates {
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Tear down every peer tracked here in the global `register`, applying
+    /// the same synthesized-vs-non-synthesized policy as `peer_down`:
+    /// synthesized entries are removed (they exist only to bridge a missing
+    /// PeerUp; without removal they accumulate across BMP session flaps);
+    /// non-synthesized entries are flipped to Disconnected so the next
+    /// PeerUp can rebind the same IngressId via `find_existing_peer`.
+    ///
+    /// Returns (ingress_id, snapshot) tuples in the shape used by
+    /// `Update::WithdrawBulk`: for synthesized entries the snapshot is the
+    /// just-removed `IngressInfo` (downstream consumers, e.g. bmp-out, need
+    /// it to construct a PeerDown PPH after the register entry is gone); for
+    /// non-synthesized entries the snapshot is `None` (downstream can look
+    /// it up in the register, which still holds the entry).
+    pub fn disconnect_into_register(
+        &self,
+        register: &ingress::Register,
+    ) -> Vec<(ingress::IngressId, Option<ingress::IngressInfo>)> {
+        self.0
+            .values()
+            .map(|peer| {
+                if peer.synthesized {
+                    (peer.ingress_id, register.remove(peer.ingress_id))
+                } else {
+                    register.update_info(
+                        peer.ingress_id,
+                        ingress::IngressInfo::new().with_state(
+                            ingress::register::IngressState::Disconnected,
+                        ),
+                    );
+                    (peer.ingress_id, None)
+                }
+            })
+            .collect()
     }
 }
 

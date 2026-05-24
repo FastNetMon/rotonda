@@ -294,32 +294,30 @@ impl RouterHandler {
                 .with_state(IngressState::Disconnected),
         );
 
-        // Signal withdrawal of all bgp sessions monitored via this BMP
-        // session:
-        let session_ids = ingress_register.ids_for_parent(ingress_id);
-        debug!(
-            "withdraw these {}/{} BGP sessions for parent BMP {ingress_id}: {session_ids:?}",
-            session_ids.len(),
-            ingress_register.current_serial(),
-        );
-        // Flip each child to Disconnected before snapshotting. When the
-        // BMP TCP session drops without per-peer PeerDown messages, the
-        // BgpViaBmp children would otherwise stay marked Connected and
-        // get enumerated as zero-route peers by the bmp-out initial dump
-        // (it filters on IngressState::Connected).
-        for id in &session_ids {
-            ingress_register.update_info(
-                *id,
-                ingress::IngressInfo::new()
-                    .with_state(IngressState::Disconnected),
-            );
-        }
+        // Tear down the per-peer entries this session owns, applying the
+        // same synthesized-vs-non-synthesized policy as machine::peer_down:
+        // synthesized entries are removed from the register (without this,
+        // every BMP session reconnect creates fresh synthesized inPost
+        // entries via the RouteMonitoring fallback in machine.rs and the
+        // old ones leak as Disconnected forever — `find_existing_peer` only
+        // rebinds entries that receive a PeerUp, and synthesized peers
+        // never do); non-synthesized entries are flipped to Disconnected so
+        // the next PeerUp can rebind them. When the state has already moved
+        // to Terminated (graceful TerminationMessage), this is a no-op
+        // because the terminate() handler already ran the same cleanup
+        // before transitioning.
         let entries: smallvec::SmallVec<
             [(ingress::IngressId, Option<ingress::IngressInfo>); 8],
-        > = session_ids
-            .into_iter()
-            .map(|id| (id, ingress_register.get(id)))
-            .collect();
+        > = bmp_state_lock
+            .as_ref()
+            .unwrap()
+            .disconnect_into_register(&ingress_register)
+            .into();
+        debug!(
+            "withdraw {}/{} BGP sessions for parent BMP {ingress_id}",
+            entries.len(),
+            ingress_register.current_serial(),
+        );
         self.gate.update_data(Update::WithdrawBulk(entries)).await;
 
         // Signal withdrawal of all address families for this ingress_id.

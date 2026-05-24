@@ -128,25 +128,21 @@ impl BmpStateDetails<Updating> {
         _msg: Option<TerminationMessage<Bytes>>,
     ) -> ProcessingResult {
         debug!("updating terminate");
-        let mut entries = SmallVec::<
+        // Apply the same synthesized-vs-non-synthesized policy as peer_down:
+        // synthesized entries are removed from the register, non-synthesized
+        // entries are flipped to Disconnected so the next PeerUp can rebind
+        // them. A Termination message ends the session without per-peer
+        // PeerDowns, so without this cleanup the children would stay
+        // Connected and synthesized inPost entries (created by the
+        // RouteMonitoring fallback in machine.rs::route_monitoring) would
+        // leak in the ingress register across BMP session flaps.
+        let entries: SmallVec<
             [(ingress::IngressId, Option<ingress::IngressInfo>); 8],
-        >::new();
-        for pph in self.details.get_peers() {
-            if let Some(id) = self.details.get_peer_ingress_id(pph) {
-                // Mark Disconnected before snapshotting: a Termination
-                // message ends the session without per-peer PeerDowns,
-                // so children would otherwise stay Connected and show
-                // up as zero-route peers in bmp-out initial dumps.
-                self.ingress_register.update_info(
-                    id,
-                    ingress::IngressInfo::new().with_state(
-                        ingress::register::IngressState::Disconnected,
-                    ),
-                );
-                let info = self.ingress_register.get(id);
-                entries.push((id, info));
-            }
-        }
+        > = self
+            .details
+            .peer_states
+            .disconnect_into_register(&self.ingress_register)
+            .into();
 
         let next_state = BmpState::Terminated(self.into());
 
