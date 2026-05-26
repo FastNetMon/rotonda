@@ -987,8 +987,8 @@ pub mod bgp {
                                 if mp_reach_nlri.is_empty() {
                                     let (afi, safi) =
                                         AfiSafiType::Ipv6Unicast.into();
-                                    mp_unreach_nlri.put_u16(afi);
-                                    mp_unreach_nlri.put_u8(safi);
+                                    mp_reach_nlri.put_u16(afi);
+                                    mp_reach_nlri.put_u8(safi);
                                     //mp_reach_nlri.put_u16(AfiSafiType::Ipv6Unicast.into());
                                     //mp_reach_nlri
                                     //    .put_u8(u8::from(AfiSafiType::Unicast));

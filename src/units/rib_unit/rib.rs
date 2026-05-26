@@ -58,7 +58,7 @@ pub struct Rib {
     #[allow(dead_code)]
     other_fams:
         HashMap<AfiSafiType, HashMap<(IngressId, Nlri<bytes::Bytes>), PaMap>>,
-    ingress_register: Arc<ingress::Register>,
+    pub(crate) ingress_register: Arc<ingress::Register>,
     roto_package: Option<Arc<RotoPackage>>,
     roto_context: Arc<Mutex<Ctx>>,
     path_attribute_interner: Arc<PathAttributeInterner>,
@@ -805,6 +805,10 @@ impl Rib {
         roto_filter: Option<RotoHttpFilter>,
         ingress_info: &HashMap<IngressId, IngressInfo>,
     ) {
+        if let Some(ingress_id) = filter.ingress_id {
+            records.retain(|r| r.multi_uniq_id == ingress_id);
+        }
+
         if let Some(rib_type) = filter.rib_type {
             records.retain(|r| {
                 ingress_info
@@ -927,6 +931,43 @@ impl Rib {
         Ok(())
     }
 
+    pub fn check_filter_and_store(
+        &self,
+        afisafi: AfiSafiType,
+        filter: &QueryFilter,
+    ) -> Result<(), String> {
+        match afisafi {
+            AfiSafiType::Ipv4Unicast | AfiSafiType::Ipv6Unicast => {
+                if self.unicast.as_ref().is_none() {
+                    return Err("Store not ready".to_string());
+                }
+            }
+            AfiSafiType::Ipv4Multicast | AfiSafiType::Ipv6Multicast => {
+                if self.multicast.as_ref().is_none() {
+                    return Err("Store not ready".to_string());
+                }
+            }
+            u => {
+                return Err(format!("address family {u} unsupported"));
+            }
+        }
+
+        if let Some(name) = filter.roto_function.as_ref() {
+            let exists =
+                self.roto_package.as_ref().map_or(false, |package| {
+                    let mut package = package.lock().unwrap();
+                    let res: Result<RotoHttpFilter, _> =
+                        package.get_function(name.as_str());
+                    res.is_ok()
+                });
+            if !exists {
+                return Err(format!("no roto function '{name}' defined"));
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn write_jsonl_stream<W: std::io::Write>(
         &self,
         afisafi: AfiSafiType,
@@ -937,48 +978,62 @@ impl Rib {
         let guard = &epoch::pin();
 
         let store = match afisafi {
-            AfiSafiType::Ipv4Unicast | AfiSafiType::Ipv4Multicast => (*self
-                .unicast)
-                .as_ref()
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Store not ready"))?,
-            AfiSafiType::Ipv6Unicast | AfiSafiType::Ipv6Multicast => {
-                (*self.multicast)
-                    .as_ref()
-                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Store not ready"))?
+            AfiSafiType::Ipv4Unicast | AfiSafiType::Ipv6Unicast => {
+                (*self.unicast).as_ref().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Store not ready",
+                    )
+                })?
+            }
+            AfiSafiType::Ipv4Multicast | AfiSafiType::Ipv6Multicast => {
+                (*self.multicast).as_ref().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Store not ready",
+                    )
+                })?
             }
             u => {
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("address family {u} unsupported")).into());
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("address family {u} unsupported"),
+                )
+                .into());
             }
         };
 
         let ingress_info = self.ingress_register.cloned_info();
 
-        let maybe_roto_function: Option<RotoHttpFilter> = match filter
-            .roto_function
-            .as_ref()
-        {
-            Some(name) => {
-                if let Some(f) =
-                    self.roto_package.as_ref().and_then(|package| {
-                        let mut package = package.lock().unwrap();
-                        package.get_function(name.as_str()).ok()
-                    })
-                {
-                    Some(f)
-                } else {
-                    return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("no roto function '{name}' defined")).into());
+        let maybe_roto_function: Option<RotoHttpFilter> =
+            match filter.roto_function.as_ref() {
+                Some(name) => {
+                    if let Some(f) =
+                        self.roto_package.as_ref().and_then(|package| {
+                            let mut package = package.lock().unwrap();
+                            package.get_function(name.as_str()).ok()
+                        })
+                    {
+                        Some(f)
+                    } else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("no roto function '{name}' defined"),
+                        )
+                        .into());
+                    }
                 }
-            }
-            None => None,
-        };
+                None => None,
+            };
 
         // Determine if we iterate over IPv4 or IPv6
         let is_v4 = query_prefix.is_v4();
-        let iter: Box<dyn Iterator<Item = PrefixRecord<RotondaPaMap>> + '_> = if is_v4 {
-            Box::new(store.prefixes_iter_v4(guard).flatten())
-        } else {
-            Box::new(store.prefixes_iter_v6(guard).flatten())
-        };
+        let iter: Box<dyn Iterator<Item = PrefixRecord<RotondaPaMap>> + '_> =
+            if is_v4 {
+                Box::new(store.prefixes_iter_v4(guard).flatten())
+            } else {
+                Box::new(store.prefixes_iter_v6(guard).flatten())
+            };
 
         for mut pr in iter {
             // 1. Filter out withdrawn records
@@ -988,7 +1043,12 @@ impl Rib {
             }
 
             // 2. Apply standard filters in place
-            self.apply_filter(&mut pr.meta, &filter, maybe_roto_function.clone(), &ingress_info);
+            self.apply_filter(
+                &mut pr.meta,
+                &filter,
+                maybe_roto_function.clone(),
+                &ingress_info,
+            );
             if pr.meta.is_empty() {
                 continue;
             }
@@ -1012,7 +1072,10 @@ impl Rib {
                         section,
                         status,
                         ingress,
-                        pamap: RotondaPaMapWithQueryFilter(&record.meta, &filter),
+                        pamap: RotondaPaMapWithQueryFilter(
+                            &record.meta,
+                            &filter,
+                        ),
                     };
                     serde_json::to_writer(&mut *target, &line)?;
                 } else {
@@ -1148,7 +1211,10 @@ impl SearchResult {
                 section,
                 status,
                 ingress,
-                pamap: RotondaPaMapWithQueryFilter(&record.meta, query_filter),
+                pamap: RotondaPaMapWithQueryFilter(
+                    &record.meta,
+                    query_filter,
+                ),
             };
             serde_json::to_writer(&mut *target, &line)?;
         } else {

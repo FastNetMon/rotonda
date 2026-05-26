@@ -898,3 +898,160 @@ fn query_metrics(
         metrics.with_name::<usize>("rib_unit_num_unique_prefixes"),
     )
 }
+
+fn mk_route_update_with_ingress(
+    prefix: &Prefix,
+    announced_as_path_str: Option<&str>,
+    ingress_id: crate::ingress::IngressId,
+) -> Update {
+    let ann;
+    let wit;
+    match announced_as_path_str {
+        Some(as_path_str) => {
+            let next_hop = if prefix.is_v4() {
+                "10.0.0.1"
+            } else {
+                "2001:db8::1"
+            };
+            ann = Announcements::from_str(&format!(
+                "e {as_path_str} {next_hop} none {prefix}",
+            ))
+            .unwrap();
+            wit = Prefixes::default();
+        }
+        None => {
+            ann = Announcements::default();
+            wit = Prefixes::new(vec![*prefix]);
+        }
+    }
+    let bgp_update_bytes = mk_bgp_update(&wit, &ann, &[]);
+
+    let roto_update_msg = UpdateMessage::from_octets(
+        bgp_update_bytes,
+        &SessionConfig::modern(),
+    )
+    .unwrap();
+    let rws = explode_announcements(&roto_update_msg).unwrap();
+    let wdws = explode_withdrawals(&roto_update_msg).unwrap();
+
+    let mut bulk = SmallVec::new();
+
+    for r in rws {
+        bulk.push(Payload::new(r, None, ingress_id, RouteStatus::Active));
+    }
+
+    for w in wdws {
+        bulk.push(Payload::new(w, None, ingress_id, RouteStatus::Withdrawn));
+    }
+    Update::Bulk(Box::new(bulk))
+}
+
+fn jsonl_ingress_ids(output: &str) -> Vec<u64> {
+    output
+        .lines()
+        .map(|line| {
+            let line: serde_json::Value = serde_json::from_str(line).unwrap();
+            line["ingress"]["id"].as_u64().unwrap()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_check_filter_and_store_and_ingress_id_filtering() {
+    let (runner, _) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+
+    let mut filter = super::QueryFilter::default();
+
+    assert!(rib
+        .check_filter_and_store(AfiSafiType::Ipv4Unicast, &filter)
+        .is_ok());
+    assert!(rib
+        .check_filter_and_store(AfiSafiType::Ipv6Unicast, &filter)
+        .is_ok());
+
+    filter.roto_function = Some("nonexistent_filter_name".to_string());
+    let err = rib.check_filter_and_store(AfiSafiType::Ipv4Unicast, &filter);
+    assert!(err.is_err());
+    assert_eq!(
+        err.unwrap_err(),
+        "no roto function 'nonexistent_filter_name' defined"
+    );
+
+    rib.ingress_register
+        .update_info(10, crate::ingress::IngressInfo::default());
+    rib.ingress_register
+        .update_info(20, crate::ingress::IngressInfo::default());
+
+    let prefix_v4 = Prefix::from_str("192.0.2.0/24").unwrap();
+    let prefix_v6 = Prefix::from_str("2001:db8::/32").unwrap();
+
+    runner
+        .process_update(mk_route_update_with_ingress(
+            &prefix_v4,
+            Some("[111,222]"),
+            10,
+        ))
+        .await
+        .unwrap();
+    runner
+        .process_update(mk_route_update_with_ingress(
+            &prefix_v4,
+            Some("[111,333]"),
+            20,
+        ))
+        .await
+        .unwrap();
+    runner
+        .process_update(mk_route_update_with_ingress(
+            &prefix_v6,
+            Some("[111,444]"),
+            10,
+        ))
+        .await
+        .unwrap();
+
+    let mut buf = Vec::new();
+    let query_filter_all = super::QueryFilter::default();
+    rib.write_jsonl_stream(
+        AfiSafiType::Ipv4Unicast,
+        Prefix::from_str("0.0.0.0/0").unwrap(),
+        query_filter_all.clone(),
+        &mut buf,
+    )
+    .map_err(|_| "stream error")
+    .unwrap();
+    let output_all = String::from_utf8(buf).unwrap();
+    let ids_all = jsonl_ingress_ids(&output_all);
+    assert!(ids_all.contains(&10));
+    assert!(ids_all.contains(&20));
+
+    let mut buf10 = Vec::new();
+    let mut query_filter_10 = super::QueryFilter::default();
+    query_filter_10.ingress_id = Some(10);
+    rib.write_jsonl_stream(
+        AfiSafiType::Ipv4Unicast,
+        Prefix::from_str("0.0.0.0/0").unwrap(),
+        query_filter_10.clone(),
+        &mut buf10,
+    )
+    .map_err(|_| "stream error")
+    .unwrap();
+    let output_10 = String::from_utf8(buf10).unwrap();
+    let ids_10 = jsonl_ingress_ids(&output_10);
+    assert!(ids_10.contains(&10));
+    assert!(!ids_10.contains(&20));
+
+    let mut buf_v6 = Vec::new();
+    rib.write_jsonl_stream(
+        AfiSafiType::Ipv6Unicast,
+        Prefix::from_str("::/0").unwrap(),
+        query_filter_all.clone(),
+        &mut buf_v6,
+    )
+    .map_err(|_| "stream error")
+    .unwrap();
+    let output_v6 = String::from_utf8(buf_v6).unwrap();
+    let ids_v6 = jsonl_ingress_ids(&output_v6);
+    assert!(ids_v6.contains(&10));
+}

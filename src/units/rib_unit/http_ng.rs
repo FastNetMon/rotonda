@@ -219,7 +219,8 @@ fn stream_search_result(
     (
         [("content-type", format.content_type())],
         Body::from_stream(stream),
-    ).into_response()
+    )
+        .into_response()
 }
 
 fn stream_all_routes(
@@ -227,22 +228,30 @@ fn stream_all_routes(
     afisafi: AfiSafiType,
     query_prefix: Prefix,
     filter: QueryFilter,
-) -> axum::response::Response {
+) -> Result<axum::response::Response, ApiError> {
+    rib.check_filter_and_store(afisafi, &filter)
+        .map_err(ApiError::BadRequest)?;
+
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(64);
     let stream = ReceiverStream::new(rx);
 
     tokio::task::spawn_blocking(move || {
         let mut writer = StreamResponseWriter::new(tx);
-        let _ = rib.write_jsonl_stream(afisafi, query_prefix, filter, &mut writer);
+        let _ = rib.write_jsonl_stream(
+            afisafi,
+            query_prefix,
+            filter,
+            &mut writer,
+        );
         let _ = writer.flush();
     });
 
-    (
+    Ok((
         [("content-type", OutputFormat::Jsonl.content_type())],
         Body::from_stream(stream),
-    ).into_response()
+    )
+        .into_response())
 }
-
 
 #[derive(Debug)]
 pub struct UnknownInclude;
@@ -294,7 +303,12 @@ async fn search_ipv4unicast(
         && prefix.len() == 0
         && filter.include.contains(&Include::MoreSpecifics)
     {
-        return Ok(stream_all_routes(rib, AfiSafiType::Ipv4Unicast, prefix, filter));
+        return Ok(stream_all_routes(
+            rib,
+            AfiSafiType::Ipv4Unicast,
+            prefix,
+            filter,
+        )?);
     }
 
     let search_result = rib
@@ -335,7 +349,12 @@ async fn search_ipv6unicast(
         && prefix.len() == 0
         && filter.include.contains(&Include::MoreSpecifics)
     {
-        return Ok(stream_all_routes(rib, AfiSafiType::Ipv6Unicast, prefix, filter));
+        return Ok(stream_all_routes(
+            rib,
+            AfiSafiType::Ipv6Unicast,
+            prefix,
+            filter,
+        )?);
     }
 
     let search_result = rib
