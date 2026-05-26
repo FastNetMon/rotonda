@@ -927,6 +927,111 @@ impl Rib {
         Ok(())
     }
 
+    pub fn write_jsonl_stream<W: std::io::Write>(
+        &self,
+        afisafi: AfiSafiType,
+        query_prefix: Prefix,
+        filter: QueryFilter,
+        target: &mut W,
+    ) -> Result<(), crate::representation::OutputError> {
+        let guard = &epoch::pin();
+
+        let store = match afisafi {
+            AfiSafiType::Ipv4Unicast | AfiSafiType::Ipv4Multicast => (*self
+                .unicast)
+                .as_ref()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Store not ready"))?,
+            AfiSafiType::Ipv6Unicast | AfiSafiType::Ipv6Multicast => {
+                (*self.multicast)
+                    .as_ref()
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Store not ready"))?
+            }
+            u => {
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("address family {u} unsupported")).into());
+            }
+        };
+
+        let ingress_info = self.ingress_register.cloned_info();
+
+        let maybe_roto_function: Option<RotoHttpFilter> = match filter
+            .roto_function
+            .as_ref()
+        {
+            Some(name) => {
+                if let Some(f) =
+                    self.roto_package.as_ref().and_then(|package| {
+                        let mut package = package.lock().unwrap();
+                        package.get_function(name.as_str()).ok()
+                    })
+                {
+                    Some(f)
+                } else {
+                    return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("no roto function '{name}' defined")).into());
+                }
+            }
+            None => None,
+        };
+
+        // Determine if we iterate over IPv4 or IPv6
+        let is_v4 = query_prefix.is_v4();
+        let iter: Box<dyn Iterator<Item = PrefixRecord<RotondaPaMap>> + '_> = if is_v4 {
+            Box::new(store.prefixes_iter_v4(guard).flatten())
+        } else {
+            Box::new(store.prefixes_iter_v6(guard).flatten())
+        };
+
+        for mut pr in iter {
+            // 1. Filter out withdrawn records
+            pr.meta.retain(|r| r.status != RouteStatus::Withdrawn);
+            if pr.meta.is_empty() {
+                continue;
+            }
+
+            // 2. Apply standard filters in place
+            self.apply_filter(&mut pr.meta, &filter, maybe_roto_function.clone(), &ingress_info);
+            if pr.meta.is_empty() {
+                continue;
+            }
+
+            // Determine if the prefix is the query prefix itself
+            let section = if pr.prefix == query_prefix {
+                "data"
+            } else {
+                "moreSpecifics"
+            };
+
+            for record in &pr.meta {
+                let ingress = ingress_info
+                    .get(&record.multi_uniq_id)
+                    .map(|info| (record.multi_uniq_id, info).into());
+                let status = RouteStatusWrapper(record.status);
+
+                if filter.fields_path_attributes.is_some() {
+                    let line = JsonlLineFiltered {
+                        prefix: pr.prefix,
+                        section,
+                        status,
+                        ingress,
+                        pamap: RotondaPaMapWithQueryFilter(&record.meta, &filter),
+                    };
+                    serde_json::to_writer(&mut *target, &line)?;
+                } else {
+                    let line = JsonlLine {
+                        prefix: pr.prefix,
+                        section,
+                        status,
+                        ingress,
+                        pamap: &record.meta,
+                    };
+                    serde_json::to_writer(&mut *target, &line)?;
+                }
+                target.write_all(b"\n")?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Query the store based on `IngressId`/MUI
     pub fn search_routes_for_ingress(
         _afisafi: AfiSafiType,

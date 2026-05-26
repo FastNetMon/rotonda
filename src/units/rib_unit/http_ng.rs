@@ -197,7 +197,7 @@ impl io::Write for StreamResponseWriter {
 
 fn stream_search_result(
     search_result: super::rib::SearchResult,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(64);
     let stream = ReceiverStream::new(rx);
 
@@ -219,8 +219,30 @@ fn stream_search_result(
     (
         [("content-type", format.content_type())],
         Body::from_stream(stream),
-    )
+    ).into_response()
 }
+
+fn stream_all_routes(
+    rib: std::sync::Arc<super::rib::Rib>,
+    afisafi: AfiSafiType,
+    query_prefix: Prefix,
+    filter: QueryFilter,
+) -> axum::response::Response {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(64);
+    let stream = ReceiverStream::new(rx);
+
+    tokio::task::spawn_blocking(move || {
+        let mut writer = StreamResponseWriter::new(tx);
+        let _ = rib.write_jsonl_stream(afisafi, query_prefix, filter, &mut writer);
+        let _ = writer.flush();
+    });
+
+    (
+        [("content-type", OutputFormat::Jsonl.content_type())],
+        Body::from_stream(stream),
+    ).into_response()
+}
+
 
 #[derive(Debug)]
 pub struct UnknownInclude;
@@ -259,16 +281,25 @@ async fn search_ipv4unicast(
     let prefix = Prefix::new_v4(prefix, prefix_len)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let s = state.store.load();
-    let search_result = match *s {
-        Some(ref store) => store
-            .search_routes(AfiSafiType::Ipv4Unicast, prefix, filter)
-            .map_err(ApiError::BadRequest)?,
+    let rib = match *s {
+        Some(ref store) => store.clone(),
         None => {
             return Err(ApiError::InternalServerError(
                 "store unavailable".into(),
             ))
         }
     };
+
+    if filter.format == OutputFormat::Jsonl
+        && prefix.len() == 0
+        && filter.include.contains(&Include::MoreSpecifics)
+    {
+        return Ok(stream_all_routes(rib, AfiSafiType::Ipv4Unicast, prefix, filter));
+    }
+
+    let search_result = rib
+        .search_routes(AfiSafiType::Ipv4Unicast, prefix, filter)
+        .map_err(ApiError::BadRequest)?;
 
     Ok(stream_search_result(search_result))
 }
@@ -291,16 +322,25 @@ async fn search_ipv6unicast(
     let prefix = Prefix::new_v6(prefix, prefix_len)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let s = state.store.load();
-    let search_result = match *s {
-        Some(ref store) => store
-            .search_routes(AfiSafiType::Ipv6Unicast, prefix, filter)
-            .map_err(ApiError::BadRequest)?,
+    let rib = match *s {
+        Some(ref store) => store.clone(),
         None => {
             return Err(ApiError::InternalServerError(
                 "store unavailable".into(),
             ))
         }
     };
+
+    if filter.format == OutputFormat::Jsonl
+        && prefix.len() == 0
+        && filter.include.contains(&Include::MoreSpecifics)
+    {
+        return Ok(stream_all_routes(rib, AfiSafiType::Ipv6Unicast, prefix, filter));
+    }
+
+    let search_result = rib
+        .search_routes(AfiSafiType::Ipv6Unicast, prefix, filter)
+        .map_err(ApiError::BadRequest)?;
 
     Ok(stream_search_result(search_result))
 }
