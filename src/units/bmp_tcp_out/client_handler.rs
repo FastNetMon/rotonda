@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
 
@@ -145,85 +145,144 @@ pub async fn perform_initial_dump(
 
     // 4. Phase 2: Single RIB walk — send all routes for all peers interleaved
     //
-    // The RIB iterator collects prefix records into a Vec under an
-    // epoch::pin() guard. For very large RIBs (tens of millions of routes)
-    // that collect is a multi-second CPU+memory burst — we run it on a
-    // blocking thread so the tokio runtime stays responsive (BGP ingest,
-    // metrics, other clients). The crossbeam_epoch Guard is !Send, so it
-    // can't span .await on a multi-threaded runtime; spawn_blocking keeps
-    // the Guard's life entirely on one thread.
+    // Streaming model: a blocking thread holds the crossbeam_epoch guard and
+    // builds BMP RouteMonitoring messages, pushing them into a bounded
+    // mpsc channel. The async side `recv`s from the channel and forwards
+    // each message to the client's writer task. Backpressure is natural —
+    // a full channel blocks the producer until the consumer drains a slot,
+    // which ties the RIB-walk rate to the client's TCP throughput.
+    //
+    // Why not just collect into a `Vec` first (the previous behavior):
+    // at 100M+ routes the `Vec<PrefixRecord>` alone is many GB, and that
+    // allocation has to coexist with the writer's mpsc, the dump_buffer
+    // accumulating live updates, and every other client's identical
+    // structures. The streaming bound is "channel capacity × message
+    // size" — kilobytes, not gigabytes.
+    //
+    // The blocking thread also owns the per-ingress route counters and
+    // the skipped-unknown map; both are returned via the JoinHandle so
+    // diagnostic output is unchanged.
+    //
+    // Channel capacity 1024 → ~150 KB worth of queued messages at the
+    // average BMP RouteMon size; small enough to apply backpressure
+    // quickly, large enough to smooth over short writer hiccups.
     let rib_walk_start = Instant::now();
-    let mut total_routes: usize = 0;
-    let rib_for_collect = rib.clone();
-    let collect_result = tokio::task::spawn_blocking(move || {
-        rib_for_collect.iter_all_prefix_records()
-    })
-    .await;
-
-    let prefix_records = match collect_result {
-        Ok(Ok(records)) => records,
-        Ok(Err(e)) => {
-            warn!(
-                "bmp-out dump for {}: failed to iterate RIB: {}",
-                client.remote_addr, e
-            );
-            Vec::new()
-        }
-        Err(join_err) => {
-            warn!(
-                "bmp-out dump for {}: RIB iteration task failed: {}",
-                client.remote_addr, join_err
-            );
-            Vec::new()
-        }
-    };
-
-    info!(
-        "bmp-out dump for {}: collected {} prefix records in {:.2}s",
-        client.remote_addr,
-        prefix_records.len(),
-        rib_walk_start.elapsed().as_secs_f64(),
-    );
-
-    // Yield to the runtime every YIELD_EVERY routes so the per-route build
-    // loop doesn't monopolise its tokio worker between socket-induced yields.
-    // Withdrawn entries are already filtered out by iter_all_prefix_records.
-    const YIELD_EVERY: usize = 1024;
-    let mut since_yield: usize = 0;
-    let mut routes_per_ingress: HashMap<IngressId, usize> =
-        HashMap::with_capacity(peer_info_map.len());
-    let mut skipped_unknown: HashMap<IngressId, usize> = HashMap::new();
-    for prefix_record in prefix_records {
-        let prefix = prefix_record.prefix;
-
-        for route_record in prefix_record.meta {
-            let ingress_id = route_record.multi_uniq_id;
-
-            // Only send routes for peers we know about
-            let peer_info = match peer_info_map.get(&ingress_id) {
-                Some(pi) => pi,
-                None => {
-                    *skipped_unknown.entry(ingress_id).or_insert(0) += 1;
-                    continue;
+    let peer_info_arc: Arc<HashMap<IngressId, PeerInfo>> =
+        Arc::new(peer_info_map);
+    let (msg_tx, mut msg_rx) =
+        tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+    let rib_for_walk = rib.clone();
+    let peer_info_for_walk = peer_info_arc.clone();
+    let walk_handle = tokio::task::spawn_blocking(move || {
+        let mut routes_per_ingress: HashMap<IngressId, usize> =
+            HashMap::with_capacity(peer_info_for_walk.len());
+        let mut skipped_unknown: HashMap<IngressId, usize> = HashMap::new();
+        let walk_result = rib_for_walk.stream_prefix_records(|pr| {
+            let prefix = pr.prefix;
+            for route_record in pr.meta {
+                let ingress_id = route_record.multi_uniq_id;
+                let peer_info =
+                    match peer_info_for_walk.get(&ingress_id) {
+                        Some(pi) => pi,
+                        None => {
+                            *skipped_unknown
+                                .entry(ingress_id)
+                                .or_insert(0) += 1;
+                            continue;
+                        }
+                    };
+                let pamap = &route_record.meta;
+                let msg = bmp_builder::build_route_monitoring(
+                    peer_info, prefix, pamap, false,
+                );
+                if msg_tx.blocking_send(msg).is_err() {
+                    // Consumer dropped (client disconnected). Bail out
+                    // of the iteration so the epoch guard is released.
+                    return false;
                 }
-            };
-
-            let pamap = &route_record.meta;
-            let msg = bmp_builder::build_route_monitoring(
-                peer_info, prefix, pamap, false,
-            );
-            total_routes += 1;
-            *routes_per_ingress.entry(ingress_id).or_insert(0) += 1;
-            if !client.send_message(msg).await {
-                return false;
+                *routes_per_ingress.entry(ingress_id).or_insert(0) += 1;
             }
+            true
+        });
+        (routes_per_ingress, skipped_unknown, walk_result)
+    });
 
-            since_yield += 1;
-            if since_yield >= YIELD_EVERY {
-                tokio::task::yield_now().await;
-                since_yield = 0;
+    const YIELD_EVERY: usize = 1024;
+    const PROGRESS_LOG_EVERY: Duration = Duration::from_secs(5);
+    let mut total_routes: usize = 0;
+    let mut since_yield: usize = 0;
+    let mut last_progress_at = rib_walk_start;
+    let mut last_progress_routes: usize = 0;
+    let mut client_disconnected = false;
+
+    while let Some(msg) = msg_rx.recv().await {
+        if !client.send_message(msg).await {
+            // Writer task gone — drop the receiver so the blocking
+            // walker's next blocking_send fails and it can exit.
+            client_disconnected = true;
+            break;
+        }
+        total_routes += 1;
+
+        since_yield += 1;
+        if since_yield >= YIELD_EVERY {
+            tokio::task::yield_now().await;
+            since_yield = 0;
+
+            let now = Instant::now();
+            if now.duration_since(last_progress_at) >= PROGRESS_LOG_EVERY {
+                let interval = now.duration_since(last_progress_at);
+                let delta = total_routes - last_progress_routes;
+                let instant_rate = delta as f64 / interval.as_secs_f64();
+                let avg_rate = total_routes as f64
+                    / now.duration_since(rib_walk_start).as_secs_f64();
+                let buf_len = client.dump_buffer.lock().await.len();
+                let buf_bytes =
+                    client.buffered_bytes.load(Ordering::Relaxed);
+                let bytes_sent_total = client
+                    .bytes_sent
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(bytes_before_dump);
+                info!(
+                    "bmp-out dump for {}: progress {} routes ({:.0} r/s now, \
+                     {:.0} r/s avg), {} buffered ({:.1} MB), {:.1} MB sent",
+                    client.remote_addr,
+                    total_routes,
+                    instant_rate,
+                    avg_rate,
+                    buf_len,
+                    buf_bytes as f64 / (1024.0 * 1024.0),
+                    bytes_sent_total as f64 / (1024.0 * 1024.0),
+                );
+                last_progress_at = now;
+                last_progress_routes = total_routes;
             }
         }
+    }
+    drop(msg_rx);
+
+    // Wait for the walker to finish so the epoch guard is released
+    // before we proceed (and for the side-channel counters).
+    let (routes_per_ingress, skipped_unknown, walk_result) =
+        match walk_handle.await {
+            Ok(triple) => triple,
+            Err(join_err) => {
+                warn!(
+                    "bmp-out dump for {}: RIB walker task failed: {}",
+                    client.remote_addr, join_err
+                );
+                (HashMap::new(), HashMap::new(), Ok(0))
+            }
+        };
+    if let Err(e) = walk_result {
+        warn!(
+            "bmp-out dump for {}: stream_prefix_records error: {}",
+            client.remote_addr, e
+        );
+    }
+
+    if client_disconnected {
+        return false;
     }
 
     let rib_walk_elapsed = rib_walk_start.elapsed();
@@ -237,7 +296,7 @@ pub async fn perform_initial_dump(
     // Diagnostic: per-peer breakdown of sent routes. Highlight any peer that
     // is in peer_info_map but had zero routes sent — those are the silent
     // drops we're hunting.
-    let mut peer_rows: Vec<(IngressId, &PeerInfo, usize)> = peer_info_map
+    let mut peer_rows: Vec<(IngressId, &PeerInfo, usize)> = peer_info_arc
         .iter()
         .map(|(id, pi)| {
             (*id, pi, routes_per_ingress.get(id).copied().unwrap_or(0))
@@ -282,7 +341,7 @@ pub async fn perform_initial_dump(
     // the synthetic Peer Up OPENs. Even an empty table needs an EoR marker.
     for peer_entry in &peers {
         let ingress_id = peer_entry.ingress_id;
-        let peer_info = match peer_info_map.get(&ingress_id) {
+        let peer_info = match peer_info_arc.get(&ingress_id) {
             Some(pi) => pi,
             None => continue,
         };

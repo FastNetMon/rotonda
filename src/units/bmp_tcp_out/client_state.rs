@@ -56,29 +56,24 @@ pub struct ClientState {
     /// Number of bytes sent to this client.
     pub bytes_sent: AtomicUsize,
 
-    /// Maximum buffer size during dump phase (grows dynamically based on available RAM).
-    pub max_buffer: AtomicUsize,
-}
+    /// Hard cap on buffered entries during dump phase. Fixed at construction.
+    pub max_buffer_entries: usize,
 
-const BUFFER_GROWTH_STEP: usize = 50_000;
-const MIN_FREE_RAM_BYTES: u64 = 512 * 1024 * 1024;
+    /// Hard cap on buffered `Update::shallow_bytes()` during dump phase.
+    /// Fixed at construction.
+    pub max_buffer_bytes: usize,
 
-fn available_ram_bytes() -> u64 {
-    unsafe {
-        let mut info: libc::sysinfo = std::mem::zeroed();
-        if libc::sysinfo(&mut info) == 0 {
-            (info.freeram as u64) * (info.mem_unit as u64)
-        } else {
-            0
-        }
-    }
+    /// Running sum of `Update::shallow_bytes()` for entries currently in
+    /// `dump_buffer`. Read by progress logging and by the overflow check.
+    pub buffered_bytes: AtomicUsize,
 }
 
 impl ClientState {
     pub fn new(
         remote_addr: SocketAddr,
         tx: mpsc::Sender<Vec<u8>>,
-        max_buffer: usize,
+        max_buffer_entries: usize,
+        max_buffer_bytes: usize,
     ) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -90,11 +85,21 @@ impl ClientState {
             connected_at: Utc::now(),
             messages_sent: AtomicUsize::new(0),
             bytes_sent: AtomicUsize::new(0),
-            max_buffer: AtomicUsize::new(max_buffer),
+            max_buffer_entries,
+            max_buffer_bytes,
+            buffered_bytes: AtomicUsize::new(0),
         }
     }
 
     /// Buffer an update only if the client is still in dump phase.
+    ///
+    /// Returns `Overflow` if either the entry cap or the byte cap would be
+    /// exceeded. The caller is expected to disconnect the client in that
+    /// case — there is no dynamic growth, by design: relying on the
+    /// kernel's free-RAM reading let bmp-out OOM the whole process on
+    /// large dumps (RSS climbed faster than glibc returned pages, so
+    /// freeram-based growth never tripped its safety net until far too
+    /// late).
     pub async fn buffer_update_if_dumping(
         &self,
         update: Update,
@@ -104,22 +109,25 @@ impl ClientState {
             return BufferUpdateResult::NotDumping;
         }
 
+        let upd_bytes = update.shallow_bytes();
         let mut buf = self.dump_buffer.lock().await;
-        let current_limit = self.max_buffer.load(Ordering::Relaxed);
-        if buf.len() >= current_limit {
-            if available_ram_bytes() < MIN_FREE_RAM_BYTES {
-                return BufferUpdateResult::Overflow;
-            }
-            self.max_buffer
-                .store(current_limit + BUFFER_GROWTH_STEP, Ordering::Relaxed);
+        if buf.len() >= self.max_buffer_entries {
+            return BufferUpdateResult::Overflow;
+        }
+        let current_bytes = self.buffered_bytes.load(Ordering::Relaxed);
+        if current_bytes.saturating_add(upd_bytes) > self.max_buffer_bytes {
+            return BufferUpdateResult::Overflow;
         }
         buf.push(update);
+        self.buffered_bytes
+            .fetch_add(upd_bytes, Ordering::Relaxed);
         BufferUpdateResult::Buffered
     }
 
     /// Take all buffered updates (drain the buffer).
     pub async fn take_buffered_updates(&self) -> Vec<Update> {
         let mut buf = self.dump_buffer.lock().await;
+        self.buffered_bytes.store(0, Ordering::Relaxed);
         std::mem::take(&mut *buf)
     }
 

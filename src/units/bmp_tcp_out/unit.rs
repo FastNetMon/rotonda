@@ -68,9 +68,17 @@ pub struct BmpTcpOut {
     #[serde(default = "BmpTcpOut::default_sys_descr")]
     pub sys_descr: String,
 
-    /// Maximum buffered updates per client during dump phase.
+    /// Maximum buffered updates per client during dump phase (entry count).
+    /// Hard cap — clients that overflow are disconnected (they reconnect for
+    /// a fresh dump). No dynamic growth.
     #[serde(default = "BmpTcpOut::default_max_client_buffer")]
     pub max_client_buffer: usize,
+
+    /// Maximum buffered bytes per client during dump phase. Counts the
+    /// shallow heap footprint of buffered `Update`s (excluding Arc-shared
+    /// PaMap bytes). Hard cap — clients that overflow are disconnected.
+    #[serde(default = "BmpTcpOut::default_max_client_buffer_bytes")]
+    pub max_client_buffer_bytes: usize,
 
     /// ACL: list of allowed IP prefixes/addresses (required).
     /// Only IPs matching at least one entry are allowed to connect.
@@ -152,6 +160,7 @@ impl BmpTcpOut {
             self.sys_name,
             self.sys_descr,
             self.max_client_buffer,
+            self.max_client_buffer_bytes,
             self.forward_router_info,
             self.acl,
             self.tls,
@@ -186,6 +195,14 @@ impl BmpTcpOut {
         100_000
     }
 
+    /// 256 MiB. Sized to absorb large bursts (peer flaps, full-table
+    /// reannouncements) without OOMing the process. Operators with many
+    /// concurrent BMP consumers should set this lower to bound aggregate
+    /// dump memory.
+    fn default_max_client_buffer_bytes() -> usize {
+        256 * 1024 * 1024
+    }
+
     fn default_forward_router_info() -> bool {
         true
     }
@@ -202,6 +219,7 @@ struct BmpTcpOutRunner {
     sys_name: String,
     sys_descr: String,
     max_client_buffer: usize,
+    max_client_buffer_bytes: usize,
     forward_router_info: bool,
     acl: Vec<PrefixOrExact>,
     tls: bool,
@@ -274,6 +292,7 @@ impl BmpTcpOutRunner {
         sys_name: String,
         sys_descr: String,
         max_client_buffer: usize,
+        max_client_buffer_bytes: usize,
         forward_router_info: bool,
         acl: Vec<PrefixOrExact>,
         tls: bool,
@@ -290,6 +309,7 @@ impl BmpTcpOutRunner {
             sys_name,
             sys_descr,
             max_client_buffer,
+            max_client_buffer_bytes,
             forward_router_info,
             acl,
             tls,
@@ -507,6 +527,7 @@ impl BmpTcpOutRunner {
             client_addr,
             tx,
             self.max_client_buffer,
+            self.max_client_buffer_bytes,
         ));
 
         let client_id = client.id;

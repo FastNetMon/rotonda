@@ -444,6 +444,40 @@ impl Update {
             Update::PeerStats { .. } => smallvec![],
         }
     }
+
+    /// Approximate the in-memory footprint of this `Update`, excluding
+    /// Arc-shared bytes (`RotondaPaMap::raw`, `PeerStats::body`).
+    ///
+    /// Used by `bmp_tcp_out`'s dump_buffer accounting to apply a hard byte
+    /// cap independent of the kernel's free-RAM heuristic. The intent is a
+    /// fast, conservative estimate of *marginal* heap growth from keeping
+    /// this `Update` alive — not a precise allocator size. PaMap byte
+    /// blobs are interned/shared with the RIB store, so counting them
+    /// here would double-count against memory we'd be holding anyway.
+    pub fn shallow_bytes(&self) -> usize {
+        use std::mem::size_of;
+        let base = size_of::<Self>();
+        match self {
+            Update::Single(_) => base,
+            Update::Bulk(payloads) => {
+                base + payloads.len() * size_of::<Payload>()
+            }
+            Update::Withdraw(..) => base,
+            Update::WithdrawBulk(items) => {
+                base
+                    + items.len()
+                        * size_of::<(IngressId, Option<IngressInfo>)>()
+            }
+            Update::IngressReappeared(..) => base,
+            Update::UpstreamStatusChange(..) => base,
+            Update::OutputStream(msgs) => {
+                base + msgs.len() * size_of::<OutputStreamMessage>()
+            }
+            Update::Rtr(..) => base,
+            // body is a Bytes (Arc-backed); shallow accounting skips it.
+            Update::PeerStats { .. } => base,
+        }
+    }
 }
 
 impl From<Payload> for Update {

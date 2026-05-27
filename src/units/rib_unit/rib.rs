@@ -691,6 +691,53 @@ impl Rib {
         Ok(res)
     }
 
+    /// Stream prefix records to a caller-supplied closure instead of
+    /// collecting into a `Vec`. The closure returns `true` to continue
+    /// iteration or `false` to stop early (e.g. on consumer disconnect).
+    ///
+    /// Use this for large dumps: collecting 100M+ route records into a
+    /// single `Vec` is many GB even without copying the Arc-backed PaMap
+    /// bytes, and that allocation has to coexist with the rest of the
+    /// process (downstream sender, in-flight live updates, etc).
+    /// Streaming bounds the working set to whatever the consumer can
+    /// drain plus one `PrefixRecord` in flight.
+    ///
+    /// Withdrawn meta entries are filtered out before the closure is
+    /// called, and prefixes whose entire meta vec is withdrawn are
+    /// skipped — matching `iter_all_prefix_records` semantics.
+    ///
+    /// The crossbeam_epoch guard is held for the entire iteration, so
+    /// any garbage produced by concurrent RIB updates cannot be
+    /// reclaimed until the closure returns. Keep iterations bounded
+    /// (the closure can return `false` once a deadline is hit) or
+    /// expect peak RSS to track update churn × wall-clock walk time.
+    pub fn stream_prefix_records<F>(
+        &self,
+        mut f: F,
+    ) -> Result<usize, String>
+    where
+        F: FnMut(PrefixRecord<RotondaPaMap>) -> bool,
+    {
+        let guard = &epoch::pin();
+        let store = (*self.unicast)
+            .as_ref()
+            .ok_or(PrefixStoreError::StoreNotReadyError.to_string())?;
+
+        let mut count = 0usize;
+        for mut pr in store.prefixes_iter(guard).flatten() {
+            pr.meta.retain(|r| r.status != RouteStatus::Withdrawn);
+            if pr.meta.is_empty() {
+                continue;
+            }
+            count += 1;
+            if !f(pr) {
+                break;
+            }
+        }
+        debug!("rib::stream_prefix_records: {} prefix records", count);
+        Ok(count)
+    }
+
     pub fn match_ingress_id(
         &self,
         ingress_id: IngressId,
