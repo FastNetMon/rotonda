@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     net::SocketAddr,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use chrono::{DateTime, Utc};
@@ -66,6 +66,14 @@ pub struct ClientState {
     /// Running sum of `Update::shallow_bytes()` for entries currently in
     /// `dump_buffer`. Read by progress logging and by the overflow check.
     pub buffered_bytes: AtomicUsize,
+
+    /// Set once a buffer overflow (or any other terminal failure) has been
+    /// observed for this client. `direct_update` uses this to skip further
+    /// work for clients that are already on their way out — without it,
+    /// every subsequent upstream Update produced a redundant "Buffer
+    /// overflow" log line and queued another empty-Vec disconnect signal
+    /// behind the still-draining dump messages.
+    pub disconnect_pending: AtomicBool,
 }
 
 impl ClientState {
@@ -88,6 +96,7 @@ impl ClientState {
             max_buffer_entries,
             max_buffer_bytes,
             buffered_bytes: AtomicUsize::new(0),
+            disconnect_pending: AtomicBool::new(false),
         }
     }
 

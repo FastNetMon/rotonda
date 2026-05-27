@@ -191,16 +191,22 @@ impl BmpTcpOut {
         "Rotonda BMP restreamer".to_string()
     }
 
+    /// 5 million Updates. Multi-minute dumps on busy systems (thousands
+    /// of peers, sustained churn) generate millions of live Updates that
+    /// must buffer until the walk finishes. The old 100k cap filled in
+    /// seconds and caused immediate disconnect. The byte cap is the
+    /// load-bearing limit; this exists as a safety rail.
     fn default_max_client_buffer() -> usize {
-        100_000
+        5_000_000
     }
 
-    /// 256 MiB. Sized to absorb large bursts (peer flaps, full-table
-    /// reannouncements) without OOMing the process. Operators with many
-    /// concurrent BMP consumers should set this lower to bound aggregate
-    /// dump memory.
+    /// 1 GiB. Sized to absorb large bursts (peer flaps, full-table
+    /// reannouncements) and multi-minute dump windows without OOMing the
+    /// process. Operators with many concurrent BMP consumers should set
+    /// this lower to bound aggregate dump memory; operators with very
+    /// long dumps may need to raise it (or accept disconnect+reconnect).
     fn default_max_client_buffer_bytes() -> usize {
-        256 * 1024 * 1024
+        1024 * 1024 * 1024
     }
 
     fn default_forward_router_info() -> bool {
@@ -247,13 +253,41 @@ impl DirectUpdate for BmpTcpOutRunner {
             clients.values().cloned().collect()
         };
         for client in &snapshot {
+            // Skip clients that have already been marked for disconnect.
+            // Without this short-circuit, every upstream Update during the
+            // window between "overflow detected" and "writer task removes
+            // the client from the map" generated a fresh "Buffer overflow"
+            // log line and another empty-Vec push — under sustained
+            // upstream churn that produces hundreds of identical log
+            // lines per second and stalls direct_update on a full writer
+            // queue.
+            if client
+                .disconnect_pending
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                continue;
+            }
             match client.buffer_update_if_dumping(update.clone()).await {
                 BufferUpdateResult::Buffered => {}
                 BufferUpdateResult::Overflow => {
-                    // Buffer overflow — mark for disconnect
-                    self.status_reporter.buffer_overflow(client.remote_addr);
-                    // Signal disconnect by closing the channel
-                    let _ = client.tx.send(Vec::new()).await;
+                    // First overflow wins: compare-and-swap claims the
+                    // disconnect, suppresses duplicate logs from races.
+                    if !client
+                        .disconnect_pending
+                        .swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        self.status_reporter
+                            .buffer_overflow(client.remote_addr);
+                        // try_send: if the writer's mpsc is already full
+                        // of dump messages, the disconnect signal will
+                        // ride the queue naturally — we don't want to
+                        // stall direct_update (and therefore the whole
+                        // upstream pipeline) waiting for a slot. If the
+                        // queue is so full that try_send fails, the
+                        // writer is already overloaded and will exit on
+                        // the next write_all error anyway.
+                        let _ = client.tx.try_send(Vec::new());
+                    }
                 }
                 BufferUpdateResult::NotDumping => {
                     // Live phase — send directly
