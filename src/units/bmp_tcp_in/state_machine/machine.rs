@@ -85,6 +85,27 @@ use super::{
 //use octseq::Octets;
 use routecore::Octets;
 
+/// Extract the 8-byte route distinguisher from a parsed BMP per-peer header.
+///
+/// `PerPeerHeader::distinguisher()` returns a slice that, per RFC 7854 and
+/// the routecore parser, is always exactly 8 bytes. We defend against a
+/// future routecore change or an unforeseen parser path by logging and
+/// returning a zero distinguisher rather than panicking — the caller never
+/// holds enough context to recover from a parser invariant break, and a DoS
+/// via panic on a single malformed peer is worse than a misindexed peer.
+fn pph_distinguisher_bytes<T: AsRef<[u8]>>(
+    pph: &PerPeerHeader<T>,
+) -> [u8; 8] {
+    <[u8; 8]>::try_from(pph.distinguisher()).unwrap_or_else(|_| {
+        warn!(
+            "BMP per-peer header distinguisher is {} bytes, expected 8; \
+             falling back to zero distinguisher",
+            pph.distinguisher().len()
+        );
+        [0u8; 8]
+    })
+}
+
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct EoRProperties {
     pub afi_safi: AfiSafiType,
@@ -997,27 +1018,34 @@ where
                                 );
                             }
                             Ok(announcements) => {
+                                // `n_valid_announcements` is incremented inside
+                                // extract_route_monitoring_routes from a separate
+                                // pass over the UPDATE, so in principle it can
+                                // disagree with `announcements_vec()` here on a
+                                // crafted message. Guard the first() lookup
+                                // rather than unwrapping.
                                 if update_report_msg.n_valid_announcements > 0
                                     && saved_self
                                         .details
                                         .is_peer_eor_capable(&pph)
                                         == Some(true)
                                 {
-                                    let afi_safi: AfiSafiType = announcements
-                                        .first()
-                                        .unwrap()
-                                        .afi_safi();
+                                    if let Some(first) = announcements.first()
+                                    {
+                                        let afi_safi: AfiSafiType =
+                                            first.afi_safi();
 
-                                    let num_pending_eors = saved_self
-                                        .details
-                                        .add_pending_eor(&pph, afi_safi);
+                                        let num_pending_eors = saved_self
+                                            .details
+                                            .add_pending_eor(&pph, afi_safi);
 
-                                    saved_self
-                                        .status_reporter
-                                        .pending_eors_update(
-                                            saved_self.router_id.clone(),
-                                            num_pending_eors,
-                                        );
+                                        saved_self
+                                            .status_reporter
+                                            .pending_eors_update(
+                                                saved_self.router_id.clone(),
+                                                num_pending_eors,
+                                            );
+                                    }
                                 }
                             }
                         }
@@ -1448,10 +1476,8 @@ impl PeerAware for PeerStates {
             PeerType::RdInstance
             | PeerType::LocalInstance
             | PeerType::LocalRibInstance => {
-                query_ingress = query_ingress.with_distinguisher(
-                    TryInto::<[u8; 8]>::try_into(&pph.distinguisher()[..8])
-                        .unwrap(),
-                );
+                query_ingress = query_ingress
+                    .with_distinguisher(pph_distinguisher_bytes(&pph));
             }
             PeerType::Reserved
             | PeerType::Unassigned(_)
@@ -1495,10 +1521,7 @@ impl PeerAware for PeerStates {
                 pending_eors: HashSet::with_capacity(0),
                 peer_details: PeerDetails {
                     peer_bgp_id: pph.bgp_id(),
-                    peer_distinguisher: pph
-                        .distinguisher()
-                        .try_into()
-                        .unwrap(),
+                    peer_distinguisher: pph_distinguisher_bytes(&pph),
                     peer_rib_type: pph.rib_type(),
                     peer_id: PeerId::new(pph.address(), pph.asn()),
                 },
@@ -1529,7 +1552,7 @@ impl PeerAware for PeerStates {
             peer_state.session_config = new_config;
             peer_state.peer_details = PeerDetails {
                 peer_bgp_id: pph.bgp_id(),
-                peer_distinguisher: pph.distinguisher().try_into().unwrap(),
+                peer_distinguisher: pph_distinguisher_bytes(pph),
                 peer_rib_type: pph.rib_type(),
                 peer_id: PeerId::new(pph.address(), pph.asn()),
             };

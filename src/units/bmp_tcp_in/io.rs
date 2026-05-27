@@ -47,6 +47,17 @@ impl FatalError for std::io::Error {
     }
 }
 
+/// Smallest legal BMP message size: version(1) + length(4) + type(1).
+const MIN_BMP_MSG_LEN: usize = 6;
+
+/// Upper bound we accept for a single BMP message. RFC 7854 imposes no hard
+/// cap, but legitimate route-monitoring frames carry a single BGP UPDATE
+/// (≤ 65 KB even with extended-length attributes) plus a few hundred bytes
+/// of BMP headers. 2 MiB is well above any real-world frame and prevents a
+/// malicious or buggy exporter from forcing multi-GiB allocations via the
+/// length field.
+const MAX_BMP_MSG_LEN: usize = 2 * 1024 * 1024;
+
 /// # Tracing
 ///
 /// If a trace id is found in the incoming message it will be returned in
@@ -75,6 +86,24 @@ async fn bmp_read<T: AsyncRead + Unpin>(
     // Don't call BmpMsg::check() as it requires the rest of the message to have already been read
     let _version = &msg_buf[0];
     let len = u32::from_be_bytes(msg_buf[1..5].try_into().unwrap()) as usize;
+
+    // The length field is attacker-controlled (cleartext BMP TCP). Reject
+    // out-of-range values before we resize the buffer: a tiny value would
+    // make the `&mut msg_buf[5..]` slice below panic, and an oversized one
+    // would let an exporter trigger arbitrary allocations.
+    if !(MIN_BMP_MSG_LEN..=MAX_BMP_MSG_LEN).contains(&len) {
+        return Err((
+            rx,
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "BMP message length {} out of range [{}, {}]",
+                    len, MIN_BMP_MSG_LEN, MAX_BMP_MSG_LEN
+                ),
+            ),
+        ));
+    }
+
     msg_buf.resize(len, 0u8);
     if let Err(err) = rx.read_exact(&mut msg_buf[5..]).await {
         return Err((rx, err));
@@ -180,5 +209,83 @@ impl<T: AsyncRead + Unpin> BmpStream<T> {
         Err(std::io::Error::other(
             "Internal error: no receiver available",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: encode a 5-byte BMP prefix with a given length field.
+    fn header_with_len(len: u32) -> Vec<u8> {
+        let mut buf = vec![3u8]; // version
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf
+    }
+
+    /// `bmp_read` against the given byte stream, run on a small tokio runtime.
+    fn run_bmp_read(input: Vec<u8>) -> Result<(Bytes, u8), std::io::Error> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let cursor = std::io::Cursor::new(input);
+            match bmp_read(cursor, TracingMode::Off).await {
+                Ok((_, msg, trace)) => Ok((msg, trace)),
+                Err((_, err)) => Err(err),
+            }
+        })
+    }
+
+    #[test]
+    fn rejects_length_below_minimum() {
+        // len = 4 is below the 6-byte BMP minimum and would have made the
+        // historical `&mut msg_buf[5..]` slice panic after resize.
+        let err = run_bmp_read(header_with_len(4)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn rejects_zero_length() {
+        let err = run_bmp_read(header_with_len(0)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn rejects_length_above_cap() {
+        // The historical code would have called BytesMut::resize with this
+        // value, attempting a ~4 GiB allocation.
+        let err = run_bmp_read(header_with_len(u32::MAX)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn accepts_frame_within_bounds() {
+        // A 6-byte InitiationMessage (type 4) with no TLVs is the smallest
+        // legal BMP frame. The routecore parser may or may not accept an
+        // empty Initiation depending on its strictness, but in either case
+        // our length-check is what we want to verify here: it must NOT
+        // reject the frame with ErrorKind::InvalidData.
+        let mut input = header_with_len(MIN_BMP_MSG_LEN as u32);
+        input.push(4u8); // BMP InitiationMessage
+        match run_bmp_read(input) {
+            Ok((msg, trace)) => {
+                assert_eq!(msg.len(), MIN_BMP_MSG_LEN);
+                assert_eq!(trace, 0);
+            }
+            Err(err) => {
+                // Any parse error from routecore is acceptable; what's not
+                // acceptable is our own length-validation rejecting a
+                // legitimately-sized frame.
+                assert_ne!(
+                    err.kind(),
+                    ErrorKind::InvalidData,
+                    "length-check spuriously rejected a {}-byte frame: {}",
+                    MIN_BMP_MSG_LEN,
+                    err,
+                );
+            }
+        }
     }
 }

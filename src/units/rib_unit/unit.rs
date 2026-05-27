@@ -489,9 +489,7 @@ impl RibUnitRunner {
         let rib = self.rib.load().clone();
         let retain = self.retain_withdrawn_attributes.load(Ordering::Relaxed);
         if let Err(e) = tokio::task::spawn_blocking(move || {
-            for (id, afisafi) in ids {
-                rib.withdraw_for_ingress(id, afisafi, retain);
-            }
+            rib.withdraw_for_ingresses(&ids, retain);
         })
         .await
         {
