@@ -318,7 +318,9 @@ impl RouterHandler {
             entries.len(),
             ingress_register.current_serial(),
         );
-        self.gate.update_data(Update::WithdrawBulk(entries)).await;
+        self.gate
+            .update_data(Update::WithdrawBulk(Box::new(entries)))
+            .await;
 
         // Signal withdrawal of all address families for this ingress_id.
         // XXX if ingress ids are assigned properly, i.e. on the BGP level

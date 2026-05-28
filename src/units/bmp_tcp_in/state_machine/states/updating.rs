@@ -149,7 +149,7 @@ impl BmpStateDetails<Updating> {
         if entries.is_empty() {
             Self::mk_state_transition_result(BmpStateIdx::Dumping, next_state)
         } else {
-            let update = Update::WithdrawBulk(entries);
+            let update = Update::WithdrawBulk(Box::new(entries));
             Self::mk_final_routing_update_result(next_state, update)
         }
 

@@ -449,7 +449,7 @@ pub async fn send_update_to_client(
             send_peer_down(client, *ingress_id, None, ingress_register).await
         }
         Update::WithdrawBulk(entries) => {
-            for (ingress_id, info) in entries {
+            for (ingress_id, info) in entries.iter() {
                 if !send_peer_down(
                     client,
                     *ingress_id,

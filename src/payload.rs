@@ -407,7 +407,14 @@ pub enum Update {
     // bmp_tcp_in's peer_down workaround). The lookup-after-remove race would
     // otherwise yield `IngressInfo::default()` and a Peer Down with a wrong
     // PPH. Producers that don't need to carry info can pass `None`.
-    WithdrawBulk(SmallVec<[(IngressId, Option<IngressInfo>); 8]>),
+    //
+    // The inner SmallVec is `Box`-ed so the enum doesn't reserve ~2.4 KB
+    // of inline storage on every `Update` slot — `IngressInfo` is a
+    // wide struct (~250–300 B) and an inline SmallVec<[(_, Option<II>); 8]>
+    // dominated size_of::<Update>() for buffers like bmp-out's dump_buffer,
+    // costing ~25x more memory per buffered entry than the variants
+    // actually in flight (which are mostly Single / Withdraw).
+    WithdrawBulk(Box<SmallVec<[(IngressId, Option<IngressInfo>); 8]>>),
     // Used to signal the RibUnit a MUI should be set to active again.
     IngressReappeared(IngressId),
     UpstreamStatusChange(UpstreamStatus),
@@ -464,6 +471,8 @@ impl Update {
             }
             Update::Withdraw(..) => base,
             Update::WithdrawBulk(items) => {
+                // Box pointer is part of `base`; account for the heap
+                // SmallVec storage too.
                 base
                     + items.len()
                         * size_of::<(IngressId, Option<IngressInfo>)>()

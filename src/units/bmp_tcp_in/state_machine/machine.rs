@@ -694,7 +694,9 @@ where
                 let entries = entries.into_iter().collect::<SmallVec<
                     [(ingress::IngressId, Option<ingress::IngressInfo>); 8],
                 >>();
-                self.mk_routing_update_result(Update::WithdrawBulk(entries))
+                self.mk_routing_update_result(Update::WithdrawBulk(
+                    Box::new(entries),
+                ))
             }
 
             /*
