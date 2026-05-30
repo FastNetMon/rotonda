@@ -465,8 +465,8 @@ pub fn build_route_monitoring(
     prefix: Prefix,
     pamap: &RotondaPaMap,
     is_withdrawal: bool,
-) -> Vec<u8> {
-    let bgp_update = build_bgp_update(prefix, pamap, is_withdrawal);
+) -> Option<Vec<u8>> {
+    let bgp_update = build_bgp_update(prefix, pamap, is_withdrawal)?;
     let total_len =
         BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + bgp_update.len();
 
@@ -475,7 +475,7 @@ pub fn build_route_monitoring(
     write_per_peer_header(&mut buf, peer);
     buf.extend_from_slice(&bgp_update);
 
-    buf
+    Some(buf)
 }
 
 /// Build a BMP Route Monitoring message from a RotondaRoute.
@@ -511,7 +511,7 @@ pub fn build_route_monitoring_from_route(
         }
     };
 
-    Some(build_route_monitoring(peer, prefix, pamap, is_withdrawal))
+    build_route_monitoring(peer, prefix, pamap, is_withdrawal)
 }
 
 /// Build a BMP Statistics Report (RFC 7854 §4.8) for the given peer.
@@ -564,9 +564,11 @@ fn build_bgp_update(
     prefix: Prefix,
     pamap: &RotondaPaMap,
     is_withdrawal: bool,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     if is_withdrawal {
-        return build_bgp_update_withdrawal(prefix);
+        // A single-prefix withdrawal is a small, fixed-shape message that
+        // can never approach the 2-byte length limit.
+        return Some(build_bgp_update_withdrawal(prefix));
     }
 
     let is_ipv4 = prefix.is_v4();
@@ -581,6 +583,10 @@ fn build_bgp_update(
         let update_body_len = 2 + 2 + pa_bytes.len() + nlri_bytes.len();
         let total_len = 19 + update_body_len;
 
+        if total_len > u16::MAX as usize {
+            return bgp_update_too_long(prefix, total_len);
+        }
+
         let mut buf = Vec::with_capacity(total_len);
         buf.extend_from_slice(&BGP_MARKER);
         buf.extend_from_slice(&(total_len as u16).to_be_bytes());
@@ -591,7 +597,7 @@ fn build_bgp_update(
         buf.extend_from_slice(&pa_bytes);
         buf.extend_from_slice(&nlri_bytes);
 
-        buf
+        Some(buf)
     } else {
         // For IPv6: add MP_REACH_NLRI (type 14) with the original next hop
         let mp_reach = build_mp_reach_nlri(prefix, orig_next_hop.as_deref());
@@ -599,6 +605,10 @@ fn build_bgp_update(
 
         let update_body_len = 2 + 2 + total_pa_len;
         let total_len = 19 + update_body_len;
+
+        if total_len > u16::MAX as usize {
+            return bgp_update_too_long(prefix, total_len);
+        }
 
         let mut buf = Vec::with_capacity(total_len);
         buf.extend_from_slice(&BGP_MARKER);
@@ -610,8 +620,23 @@ fn build_bgp_update(
         buf.extend_from_slice(&pa_bytes);
         buf.extend_from_slice(&mp_reach);
 
-        buf
+        Some(buf)
     }
+}
+
+/// A re-encoded BGP UPDATE whose total length would not fit the 2-byte BGP
+/// length field. Emitting it (with `total_len as u16` silently truncated)
+/// would desynchronize the downstream consumer's BMP/BGP framing for the rest
+/// of the stream, so drop the route instead. Reachable only with an unusually
+/// large (~65 KB) single-route attribute set, e.g. from an MRT feed.
+fn bgp_update_too_long(prefix: Prefix, total_len: usize) -> Option<Vec<u8>> {
+    log::warn!(
+        "bmp-out: dropping route for {prefix}: re-encoded BGP UPDATE length \
+         {total_len} exceeds the 2-byte BGP length field; emitting it would \
+         corrupt the BMP stream framing"
+    );
+    debug_assert!(total_len <= u16::MAX as usize);
+    None
 }
 
 /// Filter raw path attributes from RotondaPaMap, removing types 14 and 15.

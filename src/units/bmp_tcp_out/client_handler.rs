@@ -224,9 +224,14 @@ pub async fn perform_initial_dump(
                         }
                     };
                 let pamap = &route_record.meta;
-                let msg = bmp_builder::build_route_monitoring(
+                let Some(msg) = bmp_builder::build_route_monitoring(
                     peer_info, prefix, pamap, false,
-                );
+                ) else {
+                    // Route can't be re-encoded within the 2-byte BGP length
+                    // field (oversized attribute blob); drop it rather than
+                    // emit a frame that corrupts the stream.
+                    continue;
+                };
                 if msg_tx.blocking_send(msg).is_err() {
                     // Consumer dropped (client disconnected). Bail out
                     // of the iteration so the epoch guard is released.
