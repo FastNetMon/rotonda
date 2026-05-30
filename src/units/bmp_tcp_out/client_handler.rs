@@ -22,6 +22,7 @@ use super::{
     client_state::{ClientPhase, ClientState},
     metrics::BmpTcpOutMetrics,
     status_reporter::BmpTcpOutStatusReporter,
+    unit::FanInPeerDistinguisher,
 };
 
 /// Look up the parent (router-level) IngressInfo for a peer and build a
@@ -42,6 +43,32 @@ fn resolve_admin_label(
     )
 }
 
+/// Build a `PeerInfo` for re-streamed BMP output, applying both the
+/// optional Admin Label TLV and the fan-in `peer_distinguisher` tag.
+///
+/// Centralising both steps here keeps every emitted message type (PeerUp,
+/// PeerDown, RouteMonitoring, StatisticsReport, EoR) consistent on the
+/// wire. The fan-in tag depends only on the peer's `parent_ingress` and
+/// the configured policy, so the same upstream router always produces
+/// the same tag regardless of which message type is being built.
+fn build_peer_info_for_emit(
+    info: &IngressInfo,
+    ingress_register: &register::Register,
+    forward_router_info: bool,
+    fan_in_peer_distinguisher: FanInPeerDistinguisher,
+) -> PeerInfo {
+    let mut peer_info = PeerInfo::from_ingress_info(info);
+    peer_info.admin_label =
+        resolve_admin_label(info, ingress_register, forward_router_info);
+    if fan_in_peer_distinguisher.is_enabled() {
+        if let Some(parent_id) = info.parent_ingress {
+            let tag = bmp_builder::fan_in_distinguisher_tag(parent_id);
+            peer_info.apply_fan_in_distinguisher(tag);
+        }
+    }
+    peer_info
+}
+
 /// Perform the initial table dump for a newly connected BMP client.
 ///
 /// Uses a two-phase approach for fast dumps with many peers:
@@ -51,6 +78,7 @@ fn resolve_admin_label(
 /// 4. End-of-RIB markers for all peers
 /// 5. Drains any buffered updates that arrived during dump
 /// 6. Transitions client to Live phase
+#[allow(clippy::too_many_arguments)]
 pub async fn perform_initial_dump(
     client: &Arc<ClientState>,
     rib: &Arc<Rib>,
@@ -58,6 +86,7 @@ pub async fn perform_initial_dump(
     sys_name: &str,
     sys_descr: &str,
     forward_router_info: bool,
+    fan_in_peer_distinguisher: FanInPeerDistinguisher,
     _metrics: &Arc<BmpTcpOutMetrics>,
     status_reporter: &Arc<BmpTcpOutStatusReporter>,
 ) -> bool {
@@ -122,9 +151,12 @@ pub async fn perform_initial_dump(
     for peer_entry in &peers {
         let ingress_id = peer_entry.ingress_id;
         let info = &peer_entry.ingress_info;
-        let mut peer_info = PeerInfo::from_ingress_info(info);
-        peer_info.admin_label =
-            resolve_admin_label(info, ingress_register, forward_router_info);
+        let peer_info = build_peer_info_for_emit(
+            info,
+            ingress_register,
+            forward_router_info,
+            fan_in_peer_distinguisher,
+        );
 
         // Send Peer Up
         let peer_up_msg = bmp_builder::build_peer_up(&peer_info, true);
@@ -399,6 +431,7 @@ pub async fn perform_initial_dump(
                 &update,
                 ingress_register,
                 forward_router_info,
+                fan_in_peer_distinguisher,
             )
             .await
             {
@@ -419,6 +452,7 @@ pub async fn send_update_to_client(
     update: &Update,
     ingress_register: &Arc<register::Register>,
     forward_router_info: bool,
+    fan_in_peer_distinguisher: FanInPeerDistinguisher,
 ) -> bool {
     match update {
         Update::Single(payload) => {
@@ -427,6 +461,7 @@ pub async fn send_update_to_client(
                 payload,
                 ingress_register,
                 forward_router_info,
+                fan_in_peer_distinguisher,
             )
             .await
         }
@@ -437,6 +472,7 @@ pub async fn send_update_to_client(
                     payload,
                     ingress_register,
                     forward_router_info,
+                    fan_in_peer_distinguisher,
                 )
                 .await
                 {
@@ -446,7 +482,15 @@ pub async fn send_update_to_client(
             true
         }
         Update::Withdraw(ingress_id, _afisafi) => {
-            send_peer_down(client, *ingress_id, None, ingress_register).await
+            send_peer_down(
+                client,
+                *ingress_id,
+                None,
+                ingress_register,
+                forward_router_info,
+                fan_in_peer_distinguisher,
+            )
+            .await
         }
         Update::WithdrawBulk(entries) => {
             for (ingress_id, info) in entries.iter() {
@@ -455,6 +499,8 @@ pub async fn send_update_to_client(
                     *ingress_id,
                     info.as_ref(),
                     ingress_register,
+                    forward_router_info,
+                    fan_in_peer_distinguisher,
                 )
                 .await
                 {
@@ -469,6 +515,7 @@ pub async fn send_update_to_client(
                 *ingress_id,
                 ingress_register,
                 forward_router_info,
+                fan_in_peer_distinguisher,
             )
             .await
         }
@@ -479,6 +526,7 @@ pub async fn send_update_to_client(
                 body,
                 ingress_register,
                 forward_router_info,
+                fan_in_peer_distinguisher,
             )
             .await
         }
@@ -500,14 +548,15 @@ async fn send_peer_stats(
     body: &bytes::Bytes,
     ingress_register: &Arc<register::Register>,
     forward_router_info: bool,
+    fan_in_peer_distinguisher: FanInPeerDistinguisher,
 ) -> bool {
     if client.register_known_peer_if_absent(ingress_id).await {
         if let Some(info) = ingress_register.get(ingress_id) {
-            let mut peer_info = PeerInfo::from_ingress_info(&info);
-            peer_info.admin_label = resolve_admin_label(
+            let peer_info = build_peer_info_for_emit(
                 &info,
                 ingress_register,
                 forward_router_info,
+                fan_in_peer_distinguisher,
             );
             let peer_up = bmp_builder::build_peer_up(&peer_info, false);
             if !client.send_message(peer_up).await {
@@ -518,7 +567,12 @@ async fn send_peer_stats(
     }
 
     let peer_info = match ingress_register.get(ingress_id) {
-        Some(ref info) => PeerInfo::from_ingress_info(info),
+        Some(info) => build_peer_info_for_emit(
+            &info,
+            ingress_register,
+            forward_router_info,
+            fan_in_peer_distinguisher,
+        ),
         None => {
             // Peer is gone (e.g. just torn down); drop the stats report
             // rather than emit one with bogus PPH fields.
@@ -536,17 +590,18 @@ async fn send_payload_to_client(
     payload: &Payload,
     ingress_register: &Arc<register::Register>,
     forward_router_info: bool,
+    fan_in_peer_distinguisher: FanInPeerDistinguisher,
 ) -> bool {
     let ingress_id = payload.ingress_id;
 
     // Ensure we have sent Peer Up for this peer
     if client.register_known_peer_if_absent(ingress_id).await {
         if let Some(info) = ingress_register.get(ingress_id) {
-            let mut peer_info = PeerInfo::from_ingress_info(&info);
-            peer_info.admin_label = resolve_admin_label(
+            let peer_info = build_peer_info_for_emit(
                 &info,
                 ingress_register,
                 forward_router_info,
+                fan_in_peer_distinguisher,
             );
             let peer_up = bmp_builder::build_peer_up(&peer_info, false);
             if !client.send_message(peer_up).await {
@@ -556,13 +611,28 @@ async fn send_payload_to_client(
         }
     }
 
-    // Build and send Route Monitoring message
-    let info = ingress_register.get(ingress_id);
-    let peer_info = match info {
-        Some(ref info) => PeerInfo::from_ingress_info(info),
+    // Build and send Route Monitoring message. The fan-in distinguisher
+    // tag must match the Peer Up we sent for this peer, so use the same
+    // builder.
+    let peer_info = match ingress_register.get(ingress_id) {
+        Some(info) => build_peer_info_for_emit(
+            &info,
+            ingress_register,
+            forward_router_info,
+            fan_in_peer_distinguisher,
+        ),
         None => {
-            // Fall back to a default peer info
-            PeerInfo::from_ingress_info(&IngressInfo::default())
+            // Fall back to a default peer info. No parent_ingress is
+            // available, so the fan-in branch in
+            // build_peer_info_for_emit is a no-op and pd stays at zero —
+            // matching the legacy behaviour for this unknown-peer edge
+            // case.
+            build_peer_info_for_emit(
+                &IngressInfo::default(),
+                ingress_register,
+                forward_router_info,
+                fan_in_peer_distinguisher,
+            )
         }
     };
 
@@ -590,6 +660,8 @@ async fn send_peer_down(
     ingress_id: IngressId,
     snapshot_info: Option<&IngressInfo>,
     ingress_register: &Arc<register::Register>,
+    forward_router_info: bool,
+    fan_in_peer_distinguisher: FanInPeerDistinguisher,
 ) -> bool {
     if !client.has_known_peer(ingress_id).await {
         return true; // Client doesn't know about this peer, nothing to do
@@ -601,9 +673,24 @@ async fn send_peer_down(
         None
     };
     let peer_info = match (snapshot_info, fetched.as_ref()) {
-        (Some(info), _) => PeerInfo::from_ingress_info(info),
-        (None, Some(info)) => PeerInfo::from_ingress_info(info),
-        (None, None) => PeerInfo::from_ingress_info(&IngressInfo::default()),
+        (Some(info), _) => build_peer_info_for_emit(
+            info,
+            ingress_register,
+            forward_router_info,
+            fan_in_peer_distinguisher,
+        ),
+        (None, Some(info)) => build_peer_info_for_emit(
+            info,
+            ingress_register,
+            forward_router_info,
+            fan_in_peer_distinguisher,
+        ),
+        (None, None) => build_peer_info_for_emit(
+            &IngressInfo::default(),
+            ingress_register,
+            forward_router_info,
+            fan_in_peer_distinguisher,
+        ),
     };
 
     let msg = bmp_builder::build_peer_down(&peer_info);
@@ -620,11 +707,15 @@ async fn send_peer_reappeared(
     ingress_id: IngressId,
     ingress_register: &Arc<register::Register>,
     forward_router_info: bool,
+    fan_in_peer_distinguisher: FanInPeerDistinguisher,
 ) -> bool {
     if let Some(info) = ingress_register.get(ingress_id) {
-        let mut peer_info = PeerInfo::from_ingress_info(&info);
-        peer_info.admin_label =
-            resolve_admin_label(&info, ingress_register, forward_router_info);
+        let peer_info = build_peer_info_for_emit(
+            &info,
+            ingress_register,
+            forward_router_info,
+            fan_in_peer_distinguisher,
+        );
 
         // Only send Peer Up if this peer was not already known.
         if client.register_known_peer_if_absent(ingress_id).await {
@@ -641,3 +732,111 @@ async fn send_peer_reappeared(
 
 // Make register accessible from the ingress module
 use crate::ingress::register;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use inetnum::asn::Asn;
+    use std::net::{IpAddr, Ipv6Addr};
+
+    /// Build the same peer (same peer_ip, peer_asn) attributed to two
+    /// different upstream BMP routers, and assert the fan-in distinguisher
+    /// stamping yields two distinct non-zero pd values when enabled, but
+    /// stays at pd=0 when disabled.
+    #[test]
+    fn build_peer_info_stamps_pd_from_parent_ingress() {
+        let register = register::Register::default();
+        let parent_a = register.register();
+        let parent_b = register.register();
+        register.update_info(
+            parent_a,
+            IngressInfo::new().with_name("router-edge-1"),
+        );
+        register.update_info(
+            parent_b,
+            IngressInfo::new().with_name("router-edge-2"),
+        );
+
+        let peer_for = |parent_id| {
+            IngressInfo::new()
+                .with_parent_ingress(parent_id)
+                .with_remote_addr(IpAddr::V6(Ipv6Addr::new(
+                    0x2001, 0x7f8, 0x6c, 0, 0, 0, 0, 0x230,
+                )))
+                .with_remote_asn(Asn::from_u32(6939))
+        };
+
+        let info_a = peer_for(parent_a);
+        let info_b = peer_for(parent_b);
+
+        // With fan-in enabled the two upstreams must emit different
+        // non-zero distinguishers despite sharing (peer_ip, peer_asn).
+        let pi_a = build_peer_info_for_emit(
+            &info_a,
+            &register,
+            false,
+            FanInPeerDistinguisher::IngressHash,
+        );
+        let pi_b = build_peer_info_for_emit(
+            &info_b,
+            &register,
+            false,
+            FanInPeerDistinguisher::IngressHash,
+        );
+        assert_ne!(pi_a.peer_distinguisher, [0u8; 8]);
+        assert_ne!(pi_b.peer_distinguisher, [0u8; 8]);
+        assert_ne!(pi_a.peer_distinguisher, pi_b.peer_distinguisher);
+
+        // With fan-in disabled both fall back to legacy pd=0.
+        let off_a = build_peer_info_for_emit(
+            &info_a,
+            &register,
+            false,
+            FanInPeerDistinguisher::Off,
+        );
+        let off_b = build_peer_info_for_emit(
+            &info_b,
+            &register,
+            false,
+            FanInPeerDistinguisher::Off,
+        );
+        assert_eq!(off_a.peer_distinguisher, [0u8; 8]);
+        assert_eq!(off_b.peer_distinguisher, [0u8; 8]);
+    }
+
+    /// A peer with no parent_ingress (e.g. synthetic IngressInfo::default
+    /// fallback paths) must leave pd unchanged — there is no upstream
+    /// identity to encode.
+    #[test]
+    fn build_peer_info_no_parent_leaves_pd_zero() {
+        let register = register::Register::default();
+        let info = IngressInfo::new();
+        let pi = build_peer_info_for_emit(
+            &info,
+            &register,
+            false,
+            FanInPeerDistinguisher::IngressHash,
+        );
+        assert_eq!(pi.peer_distinguisher, [0u8; 8]);
+    }
+
+    /// A peer that already carries a real RD (non-zero inbound
+    /// distinguisher, e.g. a VPN peer per RFC 7854 §4.2) must pass
+    /// through unmodified even when fan-in stamping is on.
+    #[test]
+    fn build_peer_info_preserves_real_rd() {
+        let register = register::Register::default();
+        let parent = register.register();
+        let real_rd = [0u8, 1, 0, 0xfd, 0xe9, 0, 0, 7];
+        let info = IngressInfo::new()
+            .with_parent_ingress(parent)
+            .with_distinguisher(real_rd);
+        let pi = build_peer_info_for_emit(
+            &info,
+            &register,
+            false,
+            FanInPeerDistinguisher::IngressHash,
+        );
+        assert_eq!(pi.peer_distinguisher, real_rd);
+    }
+}

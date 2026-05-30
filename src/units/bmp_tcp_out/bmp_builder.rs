@@ -2,6 +2,7 @@
 ///
 /// Since routecore 0.6 has BMP parsing but no builder, we construct
 /// messages directly from bytes.
+use std::hash::Hasher;
 use std::net::IpAddr;
 
 use inetnum::addr::Prefix;
@@ -10,7 +11,7 @@ use routecore::bgp::nlri::afisafi::IsPrefix;
 use routecore::bgp::types::AfiSafiType;
 use routecore::bmp::message::PeerType;
 
-use crate::ingress::IngressInfo;
+use crate::ingress::{IngressId, IngressInfo};
 use crate::payload::{RotondaPaMap, RotondaRoute};
 use crate::roto_runtime::types::PeerRibType;
 
@@ -108,6 +109,60 @@ impl PeerInfo {
             admin_label: None,
         }
     }
+
+    /// Stamp the fan-in `peer_distinguisher` tag (RFC 7854 §4.2 opaque
+    /// 8-byte field) when the inbound peer has no real RD/VRF context.
+    ///
+    /// When rotonda multiplexes multiple upstream BMP sessions into one
+    /// downstream session, two upstream routers can each have a session
+    /// with the same neighbor (same peer_ip + peer_asn). On the wire that
+    /// produces identical per-peer-header tuples and most BMP receivers
+    /// treat them as duplicates, collapsing one upstream's view into the
+    /// other. The fix is to encode the upstream router identity in the
+    /// per-peer header's opaque distinguisher so the (peer_ip, peer_pd,
+    /// rib_type) tuple is unique per upstream.
+    ///
+    /// Behaviour:
+    ///   * If the existing `peer_distinguisher` is non-zero, the peer
+    ///     already carries a real RD (RFC 7854 RD Instance / VPN peer
+    ///     types) — leave it untouched.
+    ///   * Otherwise replace the zeros with `tag`.
+    pub fn apply_fan_in_distinguisher(&mut self, tag: [u8; 8]) {
+        if self.peer_distinguisher == [0u8; 8] {
+            self.peer_distinguisher = tag;
+        }
+    }
+}
+
+/// Derive a stable 8-byte fan-in distinguisher tag for the given upstream
+/// router (parent) IngressId.
+///
+/// Requirements:
+///   * Stable for the rotonda process lifetime (`IngressId` is allocated
+///     once per upstream session and reused on reconnect via the
+///     register's find_existing_bmp_router path).
+///   * Unique across concurrent upstream routers within one process
+///     (`IngressId` is a process-global counter, so different parents
+///     hash to different values modulo a 64-bit collision).
+///   * Always non-zero so the downstream key (peer_ip, peer_pd, rib_type)
+///     differs from the legacy pd=0 case.
+///
+/// Hash: `std::collections::hash_map::DefaultHasher` (SipHash-1-3 with
+/// fixed keys) over a typed domain prefix + the parent IngressId. The
+/// fixed seed is intentional — it makes the wire output reproducible for
+/// pcap-based debugging.
+pub fn fan_in_distinguisher_tag(parent_ingress_id: IngressId) -> [u8; 8] {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // Domain-separation prefix: keep this fan-in hash output distinct
+    // from any other use of DefaultHasher on the same numeric input.
+    hasher.write(b"rotonda:bmp-out:fan-in:v1");
+    hasher.write_u32(parent_ingress_id);
+    let v = hasher.finish();
+    // Guarantee non-zero: on the astronomically unlikely zero hash, fold
+    // to a sentinel so the tag remains distinguishable from pd=0 "no
+    // fan-in tag" / "real RD absent".
+    let v = if v == 0 { 1 } else { v };
+    v.to_be_bytes()
 }
 
 /// Write BMP Common Header to buffer.
@@ -1157,5 +1212,147 @@ mod tests {
         );
         // Value
         assert_eq!(&msg[tlv_offset + 4..], label.as_bytes());
+    }
+
+    /// Extract the 8-byte peer_distinguisher from a BMP message that
+    /// carries a per-peer header (RouteMonitoring, PeerUp, PeerDown,
+    /// StatsReport). Layout: common header (6 bytes) + peer_type (1) +
+    /// peer_flags (1) + peer_distinguisher (8) + ...
+    fn pd_from_msg(msg: &[u8]) -> [u8; 8] {
+        let off = BMP_COMMON_HEADER_LEN + 2;
+        msg[off..off + 8].try_into().expect("pd slice")
+    }
+
+    fn make_peer(pd: [u8; 8]) -> PeerInfo {
+        PeerInfo {
+            peer_type: PeerType::GlobalInstance,
+            peer_flags: 0x40,
+            peer_distinguisher: pd,
+            peer_address: IpAddr::V6(std::net::Ipv6Addr::new(
+                0x2001, 0x7f8, 0x6c, 0, 0, 0, 0, 0x230,
+            )),
+            peer_asn: Asn::from_u32(6939),
+            peer_bgp_id: [0u8; 4],
+            admin_label: None,
+        }
+    }
+
+    #[test]
+    fn fan_in_tag_is_non_zero_and_stable() {
+        let t1a = fan_in_distinguisher_tag(7);
+        let t1b = fan_in_distinguisher_tag(7);
+        assert_eq!(
+            t1a, t1b,
+            "tag must be deterministic for same parent IngressId"
+        );
+        assert_ne!(t1a, [0u8; 8], "tag must never be zero");
+    }
+
+    #[test]
+    fn fan_in_tag_differs_per_parent() {
+        // Many adjacent IngressIds; assert no pairwise collisions in the
+        // small space we care about. A 64-bit SipHash should not collide
+        // for the first thousand consecutive u32 inputs.
+        let mut tags: Vec<[u8; 8]> =
+            (1..=64).map(fan_in_distinguisher_tag).collect();
+        tags.sort();
+        let original_len = tags.len();
+        tags.dedup();
+        assert_eq!(
+            tags.len(),
+            original_len,
+            "fan-in tags collided across distinct parent IngressIds"
+        );
+    }
+
+    #[test]
+    fn apply_fan_in_only_stamps_zero_pd() {
+        // Inbound pd=0: tag is applied.
+        let tag = fan_in_distinguisher_tag(42);
+        let mut p = make_peer([0u8; 8]);
+        p.apply_fan_in_distinguisher(tag);
+        assert_eq!(p.peer_distinguisher, tag);
+
+        // Inbound pd already non-zero (real RD/VRF): tag is NOT applied.
+        let real_rd = [1, 2, 3, 4, 9, 9, 9, 9];
+        let mut p = make_peer(real_rd);
+        p.apply_fan_in_distinguisher(tag);
+        assert_eq!(
+            p.peer_distinguisher, real_rd,
+            "must not overwrite real RD"
+        );
+    }
+
+    #[test]
+    fn fan_in_two_upstreams_same_peer_produce_different_pd_on_wire() {
+        // Spec acceptance test #1: two fake upstream BMP sessions, each
+        // with a PeerUp for the same (peer_ip, peer_asn). Resulting
+        // per-peer headers must carry two different non-zero
+        // peer_distinguisher values.
+        let tag_a = fan_in_distinguisher_tag(101);
+        let tag_b = fan_in_distinguisher_tag(202);
+        assert_ne!(tag_a, tag_b);
+        assert_ne!(tag_a, [0u8; 8]);
+        assert_ne!(tag_b, [0u8; 8]);
+
+        let mut peer_a = make_peer([0u8; 8]);
+        peer_a.apply_fan_in_distinguisher(tag_a);
+
+        let mut peer_b = make_peer([0u8; 8]);
+        peer_b.apply_fan_in_distinguisher(tag_b);
+
+        let msg_a = build_peer_up(&peer_a, false);
+        let msg_b = build_peer_up(&peer_b, false);
+
+        let pd_a = pd_from_msg(&msg_a);
+        let pd_b = pd_from_msg(&msg_b);
+
+        assert_eq!(pd_a, tag_a);
+        assert_eq!(pd_b, tag_b);
+        assert_ne!(pd_a, pd_b);
+        assert_ne!(pd_a, [0u8; 8]);
+    }
+
+    #[test]
+    fn fan_in_pd_consistent_across_message_types_for_one_upstream() {
+        // Spec acceptance test #2: RouteMonitoring carries the same tag
+        // as PeerUp, and PeerDown carries the matching tag.
+        let tag = fan_in_distinguisher_tag(303);
+        let mut peer = make_peer([0u8; 8]);
+        peer.apply_fan_in_distinguisher(tag);
+
+        let pd_peer_up = pd_from_msg(&build_peer_up(&peer, false));
+        let pd_peer_down = pd_from_msg(&build_peer_down(&peer));
+        let pd_eor =
+            pd_from_msg(&build_eor_ipv4(&peer));
+        let pd_eor6 = pd_from_msg(&build_eor_mp_unreach(
+            &peer,
+            AfiSafiType::Ipv6Unicast,
+        ));
+        let pd_stats = pd_from_msg(&build_statistics_report(
+            &peer,
+            &[0u8, 0, 0, 0],
+        ));
+
+        assert_eq!(pd_peer_up, tag);
+        assert_eq!(pd_peer_down, tag);
+        assert_eq!(pd_eor, tag);
+        assert_eq!(pd_eor6, tag);
+        assert_eq!(pd_stats, tag);
+    }
+
+    #[test]
+    fn fan_in_preserves_inbound_non_zero_pd_on_wire() {
+        // Spec acceptance test #3: an inbound peer whose own
+        // peer_distinguisher is already non-zero (real RD context)
+        // passes through unmodified even when fan-in tagging is on.
+        let real_rd = [0u8, 1, 0, 0xfd, 0xe9, 0, 0, 1];
+        let tag = fan_in_distinguisher_tag(404);
+        let mut peer = make_peer(real_rd);
+        peer.apply_fan_in_distinguisher(tag);
+
+        assert_eq!(peer.peer_distinguisher, real_rd);
+        assert_eq!(pd_from_msg(&build_peer_up(&peer, false)), real_rd);
+        assert_eq!(pd_from_msg(&build_peer_down(&peer)), real_rd);
     }
 }

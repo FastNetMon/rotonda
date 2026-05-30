@@ -7,6 +7,23 @@ Released yyyy-mm-dd.
 
 ### Breaking changes
 
+* `bmp-tcp-out` wire format: the BMP per-peer header `peer_distinguisher`
+  field (RFC 7854 §4.2) now carries an 8-byte tag derived from the
+  upstream router identity when rotonda is multiplexing multiple
+  upstream BMP sessions into one downstream session. Previously this
+  field was always zero for non-VPN peers, which made the standard
+  `(peer_ip, peer_distinguisher, rib_type)` peer key collide whenever
+  two upstream routers had a BGP session with the same neighbor.
+  Downstream collectors that rely on `peer_distinguisher == 0` for
+  non-VPN peers will see the change; per RFC 7854 the field is opaque
+  to receivers and must not be interpreted, only used as part of the
+  peer key. Real RD/VRF distinguishers from VPN peer types are
+  preserved unchanged.
+
+  Operators who need the legacy behaviour can set
+  `fan_in_peer_distinguisher = "off"` in the `bmp-tcp-out` unit
+  configuration. The default is `"ingress_hash"`.
+
 
 ### New
 

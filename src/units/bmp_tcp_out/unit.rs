@@ -42,6 +42,25 @@ use super::{
 
 //-------- BmpTcpOut config --------------------------------------------------
 
+/// Fan-in `peer_distinguisher` stamping policy. See
+/// [`BmpTcpOut::fan_in_peer_distinguisher`].
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FanInPeerDistinguisher {
+    /// Stamp the upstream parent IngressId's hash as the per-peer header
+    /// distinguisher when the inbound peer carries pd=0.
+    #[default]
+    IngressHash,
+    /// Preserve the legacy wire format (pd=0 for all non-VPN peers).
+    Off,
+}
+
+impl FanInPeerDistinguisher {
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::IngressHash)
+    }
+}
+
 #[serde_as]
 #[derive(Clone, Debug, Deserialize)]
 pub struct BmpTcpOut {
@@ -94,6 +113,23 @@ pub struct BmpTcpOut {
     /// Label TLV (type 4, RFC 9736) in Peer Up messages. Default: true.
     #[serde(default = "BmpTcpOut::default_forward_router_info")]
     pub forward_router_info: bool,
+
+    /// Fan-in `peer_distinguisher` policy (RFC 7854 §4.2). When multiple
+    /// upstream BMP sessions are multiplexed into one downstream session,
+    /// peers from different upstream routers can share the same
+    /// (peer_ip, peer_asn). Stamping the upstream router identity into
+    /// the per-peer header's opaque distinguisher keeps the downstream
+    /// (peer_ip, peer_pd, rib_type) tuple unique per upstream.
+    ///
+    /// Values:
+    ///   * `ingress_hash` (default) — derive an 8-byte tag from the
+    ///     upstream parent IngressId. Applied only when the inbound
+    ///     `peer_distinguisher` is zero, so real RD/VRF peers are not
+    ///     overwritten.
+    ///   * `off` — preserve the legacy wire format (pd left at zero for
+    ///     all non-VPN peers).
+    #[serde(default)]
+    pub fan_in_peer_distinguisher: FanInPeerDistinguisher,
 
     /// Enable TLS encryption for client connections. Default: false.
     #[serde(default)]
@@ -162,6 +198,7 @@ impl BmpTcpOut {
             self.max_client_buffer,
             self.max_client_buffer_bytes,
             self.forward_router_info,
+            self.fan_in_peer_distinguisher,
             self.acl,
             self.tls,
             self.tls_cert,
@@ -227,6 +264,7 @@ struct BmpTcpOutRunner {
     max_client_buffer: usize,
     max_client_buffer_bytes: usize,
     forward_router_info: bool,
+    fan_in_peer_distinguisher: FanInPeerDistinguisher,
     acl: Vec<PrefixOrExact>,
     tls: bool,
     tls_cert: Option<String>,
@@ -297,6 +335,7 @@ impl DirectUpdate for BmpTcpOutRunner {
                         &update,
                         &self.ingress_register,
                         self.forward_router_info,
+                        self.fan_in_peer_distinguisher,
                     )
                     .await
                     {
@@ -329,6 +368,7 @@ impl BmpTcpOutRunner {
         max_client_buffer: usize,
         max_client_buffer_bytes: usize,
         forward_router_info: bool,
+        fan_in_peer_distinguisher: FanInPeerDistinguisher,
         acl: Vec<PrefixOrExact>,
         tls: bool,
         tls_cert: Option<String>,
@@ -346,6 +386,7 @@ impl BmpTcpOutRunner {
             max_client_buffer,
             max_client_buffer_bytes,
             forward_router_info,
+            fan_in_peer_distinguisher,
             acl,
             tls,
             tls_cert,
@@ -618,6 +659,7 @@ impl BmpTcpOutRunner {
         let sys_name = self.sys_name.clone();
         let sys_descr = self.sys_descr.clone();
         let forward_router_info = self.forward_router_info;
+        let fan_in_peer_distinguisher = self.fan_in_peer_distinguisher;
         let metrics_for_dump = self.metrics.clone();
         let status_reporter_for_dump = self.status_reporter.clone();
 
@@ -654,6 +696,7 @@ impl BmpTcpOutRunner {
                         &sys_name,
                         &sys_descr,
                         forward_router_info,
+                        fan_in_peer_distinguisher,
                         &metrics_for_dump,
                         &status_reporter_for_dump,
                     )
@@ -681,6 +724,7 @@ impl BmpTcpOutRunner {
                             &update,
                             &ingress_register,
                             forward_router_info,
+                            fan_in_peer_distinguisher,
                         )
                         .await
                         {
