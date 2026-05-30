@@ -264,6 +264,24 @@ impl RotondaPaMap {
         let ppi = byte_to_ppi(self.raw[1]);
         OwnedPathAttributes::new(ppi, self.raw[2..].to_vec())
     }
+
+    /// Borrowing equivalent of [`path_attributes`](Self::path_attributes):
+    /// returns a path-attribute iterator over `&self.raw[2..]` with no heap
+    /// copy. `path_attributes()` clones the whole attribute blob (`to_vec`)
+    /// every call; on the JSONL full-table dump path that is one alloc+memcpy
+    /// per emitted record (potentially 100M+), all avoidable here.
+    pub fn path_attributes_ref(
+        &self,
+    ) -> routecore::bgp::path_attributes::PathAttributes<'_, Arc<[u8]>> {
+        let ppi = byte_to_ppi(self.raw[1]);
+        // Borrow the shared `Arc<[u8]>` (no copy) and skip the rpki(1)+ppi(1)
+        // prefix bytes; `PathAttributes` then parses from the parser's
+        // current position. `byte_to_ppi(self.raw[1])` already established
+        // that there are >= 2 bytes, so the advance cannot short-read.
+        let mut parser = octseq::Parser::from_ref(&self.raw);
+        let _ = parser.advance(2);
+        routecore::bgp::path_attributes::PathAttributes::new(parser, ppi)
+    }
 }
 
 impl fmt::Display for RotondaPaMap {
@@ -282,8 +300,7 @@ impl Serialize for RotondaPaMap {
         s.serialize_field(
             "pathAttributes",
             &self
-                .path_attributes()
-                .iter()
+                .path_attributes_ref()
                 .flatten()
                 .filter(|pa| pa.type_code() != 15)
                 .flat_map(|pa| pa.to_owned())
@@ -308,8 +325,7 @@ impl<'a, 'b> Serialize for RotondaPaMapWithQueryFilter<'a, 'b> {
             "pathAttributes",
             &self
                 .0
-                .path_attributes()
-                .iter()
+                .path_attributes_ref()
                 .flatten()
                 .filter(|pa| {
                     (self

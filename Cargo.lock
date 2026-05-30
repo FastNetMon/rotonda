@@ -2675,6 +2675,7 @@ dependencies = [
  "memmap2 0.9.10",
  "micromap",
  "non-empty-vec",
+ "octseq",
  "paste",
  "pin-project-lite",
  "prometheus-parse",
