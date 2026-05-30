@@ -321,9 +321,19 @@ async fn search_ipv4unicast(
         )?);
     }
 
-    let search_result = rib
-        .search_routes(AfiSafiType::Ipv4Unicast, prefix, filter)
-        .map_err(ApiError::BadRequest)?;
+    // Run the synchronous query (store match_prefix + apply_filter, which
+    // takes the roto_context lock when a roto filter is supplied) on the
+    // blocking pool rather than inline on a tokio worker, so a CPU-bound or
+    // roto-filtered query cannot stall the async runtime. Mirrors the jsonl
+    // streaming path, which already uses spawn_blocking.
+    let search_result = tokio::task::spawn_blocking(move || {
+        rib.search_routes(AfiSafiType::Ipv4Unicast, prefix, filter)
+    })
+    .await
+    .map_err(|e| {
+        ApiError::InternalServerError(format!("search task failed: {e}"))
+    })?
+    .map_err(ApiError::BadRequest)?;
 
     Ok(stream_search_result(search_result))
 }
@@ -373,9 +383,15 @@ async fn search_ipv6unicast(
         )?);
     }
 
-    let search_result = rib
-        .search_routes(AfiSafiType::Ipv6Unicast, prefix, filter)
-        .map_err(ApiError::BadRequest)?;
+    // See the IPv4 handler: run the synchronous query off the async worker.
+    let search_result = tokio::task::spawn_blocking(move || {
+        rib.search_routes(AfiSafiType::Ipv6Unicast, prefix, filter)
+    })
+    .await
+    .map_err(|e| {
+        ApiError::InternalServerError(format!("search task failed: {e}"))
+    })?
+    .map_err(ApiError::BadRequest)?;
 
     Ok(stream_search_result(search_result))
 }
