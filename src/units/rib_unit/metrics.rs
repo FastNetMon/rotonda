@@ -7,9 +7,9 @@ use std::{
 };
 
 use arc_swap::{ArcSwap, ArcSwapAny};
+use dashmap::DashMap;
 
 use crate::{
-    common::frim::FrimMap,
     comms::{Gate, GateMetrics},
     ingress::IngressId,
     metrics::{
@@ -34,7 +34,10 @@ pub struct RibUnitMetrics {
     pub last_insert_duration_micros: AtomicU64,
     pub last_update_duration_micros: AtomicU64,
     //routers: Arc<FrimMap<Arc<RouterId>, Arc<RouterMetrics>>>,
-    routers: Arc<FrimMap<IngressId, Arc<RouterMetrics>>>,
+    // A concurrent hash map (O(1) lookup) rather than FrimMap: this is hit
+    // once (twice for withdrawals) per prefix on the RIB update hot path, so
+    // FrimMap's arc-swap load + linear scan dominated CPU under load.
+    routers: Arc<DashMap<IngressId, Arc<RouterMetrics>>>,
     pub rib_merge_update_stats: Arc<RibMergeUpdateStatistics>,
 }
 
@@ -44,13 +47,11 @@ impl RibUnitMetrics {
         //router_id: Arc<RouterId>,
         ingress_id: IngressId,
     ) -> Arc<RouterMetrics> {
-        #[allow(clippy::unwrap_or_default)]
         self.routers
-            // do we still need the Arc for Key K now that
-            // it's basically a u32 instead of a
-            // String/enum ?
             .entry(ingress_id)
             .or_insert_with(Default::default)
+            .value()
+            .clone()
     }
 }
 
@@ -213,16 +214,15 @@ impl metrics::Source for RibUnitMetrics {
             metrics.last_e2e_delay_at.load().elapsed() <= max_age
         });
 
-        for (router_id, metrics) in self.routers.guard().iter() {
-            //let router_id = router_id.as_str();
+        for entry in self.routers.iter() {
             append_per_router_metric(
                 unit_name,
                 target,
                 // TODO this should come from the ingress::Register and
                 // preferably be a nice name or ip address
-                format!("{}", router_id),
+                format!("{}", entry.key()),
                 Self::LAST_END_TO_END_DELAY_PER_ROUTER_METRIC,
-                metrics.last_e2e_delay_millis.load(SeqCst),
+                entry.value().last_e2e_delay_millis.load(SeqCst),
             );
         }
 

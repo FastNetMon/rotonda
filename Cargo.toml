@@ -40,6 +40,7 @@ arc-swap           = "1.8"
 chrono             = { version = "0.4", default-features = false, features = ["serde", "now"] }
 clap               = { version = "4.5", default-features = false, features = ["cargo"] }
 crossbeam-utils    = "0.8"
+dashmap            = "6.1" # O(1) concurrent map for the per-router metrics hot path
 fern               = "0.7"
 futures            = "0.3"
 hash32             = "1.0.0" # this can probably go
