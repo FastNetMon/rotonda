@@ -299,10 +299,20 @@ async fn search_ipv4unicast(
         }
     };
 
-    if filter.format == OutputFormat::Jsonl
-        && prefix.len() == 0
-        && filter.include.contains(&Include::MoreSpecifics)
-    {
+    // A /0 + moreSpecifics request dumps every prefix in the RIB. Only the
+    // jsonl path streams it through a byte-bounded buffer; the non-streaming
+    // (default JSON) path collects the entire RIB into one in-memory
+    // RecordSet before serializing, which spikes RSS / OOMs the process on a
+    // production-sized table. Require the streaming format for full-RIB dumps
+    // rather than risk a crash on the most obvious "show all routes" GET.
+    if prefix.len() == 0 && filter.include.contains(&Include::MoreSpecifics) {
+        if filter.format != OutputFormat::Jsonl {
+            return Err(ApiError::BadRequest(
+                "full-RIB dump (/0 with moreSpecifics) requires format=jsonl \
+                 so it can be streamed within bounded memory"
+                    .into(),
+            ));
+        }
         return Ok(stream_all_routes(
             rib,
             AfiSafiType::Ipv4Unicast,
@@ -345,10 +355,16 @@ async fn search_ipv6unicast(
         }
     };
 
-    if filter.format == OutputFormat::Jsonl
-        && prefix.len() == 0
-        && filter.include.contains(&Include::MoreSpecifics)
-    {
+    // See the IPv4 handler: full-RIB dumps must stream as jsonl, otherwise the
+    // non-streaming path materializes the entire RIB in memory and can OOM.
+    if prefix.len() == 0 && filter.include.contains(&Include::MoreSpecifics) {
+        if filter.format != OutputFormat::Jsonl {
+            return Err(ApiError::BadRequest(
+                "full-RIB dump (/0 with moreSpecifics) requires format=jsonl \
+                 so it can be streamed within bounded memory"
+                    .into(),
+            ));
+        }
         return Ok(stream_all_routes(
             rib,
             AfiSafiType::Ipv6Unicast,
