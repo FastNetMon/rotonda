@@ -879,7 +879,7 @@ where
                     // routes reactivate the mui via the rib insert path.
                     let new_ingress_id = self
                         .ingress_register
-                        .find_existing_peer(&adapted_ingress_info)
+                        .find_existing_peer_and_claim(&adapted_ingress_info)
                         .map(|(id, _)| id)
                         .unwrap_or_else(|| self.ingress_register.register());
                     warn!("Synthesized ingress_id {} based on PeerUp with ingress_id {}, info {:?}",
@@ -941,7 +941,7 @@ where
                     // Layer D reuse (see the nulled-flags arm above).
                     let new_ingress_id = self
                         .ingress_register
-                        .find_existing_peer(&adapted_ingress_info)
+                        .find_existing_peer_and_claim(&adapted_ingress_info)
                         .map(|(id, _)| id)
                         .unwrap_or_else(|| self.ingress_register.register());
                     self.ingress_register
@@ -1509,7 +1509,7 @@ impl PeerAware for PeerStates {
         let peer_ingress_id;
         let existing_peer_ingress_id;
         if let Some((ingress_id, _ingress_info)) =
-            ingress_register.find_existing_peer(&query_ingress)
+            ingress_register.find_existing_peer_and_claim(&query_ingress)
         {
             //debug!("got existing ingress_id for BGP in BMP peer {}", ingress_id);
             peer_ingress_id = ingress_id;

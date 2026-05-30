@@ -522,6 +522,39 @@ impl Register {
         None
     }
 
+    /// Like [`find_existing_peer`](Self::find_existing_peer), but atomically
+    /// *claims* the matched entry by flipping it to `Connected` under a single
+    /// write lock before returning it.
+    ///
+    /// This closes the find-then-`update_info` TOCTOU window: two concurrent
+    /// reconnects of the same peer (independent per-connection tasks sharing
+    /// one register) can otherwise both observe the same `Disconnected` entry
+    /// — the read-time `Connected` guard cannot prevent the double-claim —
+    /// and bind to one mui, so their routes overwrite each other in the RIB.
+    /// With the claim, the first caller flips the entry to `Connected`; the
+    /// second sees it `Connected`, skips it, and registers a fresh id. The
+    /// caller is still expected to follow up with `update_info` to merge the
+    /// richer PeerUp details onto the (now reserved) entry.
+    pub fn find_existing_peer_and_claim(
+        &self,
+        query: &IngressInfo,
+    ) -> Option<(IngressId, IngressInfo)> {
+        let mut lock = self.info.write().unwrap();
+        for (id, info) in lock.iter_mut() {
+            if info.state == Some(IngressState::Connected) {
+                continue;
+            }
+            if find_existing_for!(info, query,
+                {parent_ingress, remote_addr, remote_asn},
+                {rib_type, peer_rib_type, peer_type, distinguisher, vrf_name}
+            ) {
+                info.state = Some(IngressState::Connected);
+                return Some((*id, info.clone()));
+            }
+        }
+        None
+    }
+
     /// Search existing [`IngressId`] on the BMP router leven
     ///
     /// For the BMP router level, the comparison is based on the parent
@@ -533,13 +566,21 @@ impl Register {
     /// has been parsed, so this is called from the `Initiating` state handler
     /// (not at TCP-accept). Exporters that send no sysName share the
     /// "no-sysname" sentinel, falling back to remote-address matching.
-    pub fn find_existing_bmp_router(
+    ///
+    /// Atomically *claims* the matched entry by flipping it to `Connected`
+    /// under a single write lock before returning it, closing the
+    /// find-then-`update_info` TOCTOU window (see
+    /// [`find_existing_peer_and_claim`](Self::find_existing_peer_and_claim)):
+    /// two simultaneous reconnects of the same router would otherwise both
+    /// adopt one id, and the first to tear down would withdraw the live
+    /// session's routes and unmap the shared id.
+    pub fn find_existing_bmp_router_and_claim(
         &self,
         query: &IngressInfo,
     ) -> Option<(IngressId, IngressInfo)> {
-        let lock = self.info.read().unwrap();
+        let mut lock = self.info.write().unwrap();
         log::debug!("query: {query:?}");
-        for (id, info) in lock.iter() {
+        for (id, info) in lock.iter_mut() {
             // Never adopt an id that is still Connected: another (possibly
             // stale half-open) session is using it. Reusing it would put two
             // live sessions on one id, and the stale session's teardown would
@@ -553,6 +594,7 @@ impl Register {
                 {name}
             ) {
                 log::debug!("found matching bmp router, id {id}");
+                info.state = Some(IngressState::Connected);
                 return Some((*id, info.clone()));
             }
         }

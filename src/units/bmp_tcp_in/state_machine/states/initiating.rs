@@ -104,7 +104,9 @@ impl BmpStateDetails<Initiating> {
                     .with_name(sys_name)
                     .with_desc(sys_desc);
 
-                match self.ingress_register.find_existing_bmp_router(&identity)
+                match self
+                    .ingress_register
+                    .find_existing_bmp_router_and_claim(&identity)
                 {
                     Some((existing_id, _))
                         if existing_id != self.ingress_id =>
