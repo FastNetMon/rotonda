@@ -409,7 +409,11 @@ impl ConfigFile {
             line_starts: config_str.as_bytes().split(|ch| *ch == b'\n').fold(
                 vec![0],
                 |mut starts, slice| {
-                    starts.push(starts.last().unwrap() + slice.len());
+                    // `+ 1` accounts for the '\n' byte that `split` consumed,
+                    // so each entry is the real byte offset of the next line's
+                    // start in `config_str` (the same byte space the TOML
+                    // span offsets in `Marked::index` are measured in).
+                    starts.push(starts.last().unwrap() + slice.len() + 1);
                     starts
                 },
             ),
@@ -434,15 +438,22 @@ impl ConfigFile {
     }
 
     fn resolve_pos(&self, pos: usize) -> LineCol {
-        let line = self
+        // `line_starts[i]` is the byte offset of the start of line `i`
+        // (0-based), seeded with `0`. The line containing `pos` is the last
+        // one whose start is `<= pos`. Because `line_starts[0] == 0 <= pos`
+        // always holds, `rposition` always matches at least index 0, so this
+        // can neither underflow nor index out of bounds (the previous
+        // implementation compared offset *values* against line indices and
+        // panicked via `0usize - 1` for essentially every non-zero `pos`).
+        let idx = self
             .line_starts
             .iter()
-            .find(|&&start| start < pos)
-            .copied()
-            .unwrap_or(self.line_starts.len());
-        let line = line - 1;
-        let col = self.line_starts[line] - pos;
-        LineCol { line, col }
+            .rposition(|&start| start <= pos)
+            .unwrap_or(0);
+        LineCol {
+            line: idx + 1,
+            col: pos - self.line_starts[idx] + 1,
+        }
     }
 }
 
@@ -544,5 +555,55 @@ impl ops::Deref for ConfigPath {
 impl AsRef<Path> for ConfigPath {
     fn as_ref(&self) -> &Path {
         self.0.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk(toml: &str) -> ConfigFile {
+        ConfigFile::new(toml.as_bytes().to_vec(), Source::default()).unwrap()
+    }
+
+    /// Independently compute the expected 1-based (line, col) for a byte
+    /// offset into the (re-serialized) config bytes.
+    fn expected(bytes: &[u8], pos: usize) -> (usize, usize) {
+        let mut line = 1;
+        let mut line_start = 0;
+        for (i, b) in bytes.iter().enumerate().take(pos) {
+            if *b == b'\n' {
+                line += 1;
+                line_start = i + 1;
+            }
+        }
+        (line, pos - line_start + 1)
+    }
+
+    #[test]
+    fn resolve_pos_never_panics_and_is_correct() {
+        // The unresolved-link error path (Manager::prepare -> resolve_config
+        // -> resolve_pos) used to panic via `0usize - 1` for any non-zero
+        // offset, crashing at startup and on SIGHUP reload. Verify every
+        // byte offset now resolves without panicking and matches an
+        // independent line/col computation.
+        let cf =
+            mk("[units.a]\ntype = \"bmp-tcp-in\"\nlisten = \"1.2.3.4:5\"\n");
+        let bytes = cf.bytes().to_vec();
+        for pos in 0..=bytes.len() {
+            let lc = cf.resolve_pos(pos);
+            assert_eq!((lc.line, lc.col), expected(&bytes, pos), "pos {pos}");
+        }
+    }
+
+    #[test]
+    fn resolve_pos_start_of_second_line() {
+        // A position at the start of the 2nd line reports line 2, col 1 —
+        // and is not off by the number of preceding newlines.
+        let cf = mk("a = 1\nb = 2\n");
+        let bytes = cf.to_string().into_owned();
+        let nl = bytes.find('\n').unwrap();
+        let lc = cf.resolve_pos(nl + 1);
+        assert_eq!((lc.line, lc.col), (2, 1));
     }
 }
