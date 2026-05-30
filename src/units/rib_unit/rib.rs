@@ -724,15 +724,33 @@ impl Rib {
             disconnected.intersection(&prev).copied().collect();
 
         if !to_reclaim.is_empty() {
-            self.remove_for_ingresses(&to_reclaim);
-            for id in &to_reclaim {
-                self.ingress_register.remove(*id);
+            // Atomically remove each still-Disconnected id from the register
+            // FIRST, and only physically reclaim the store records
+            // (remove_mui) for ids that were actually removed. A peer that
+            // reconnected and rebound its id in the window since the
+            // cloned_info() snapshot is now Connected: remove_if_disconnected
+            // returns None for it, so we neither delete its live registration
+            // nor wipe its freshly inserted routes. Removing from the register
+            // before remove_mui also means any concurrent reuse can no longer
+            // match this id (it mints a fresh one instead), so remove_mui only
+            // ever clears the old, genuinely-departed session's records.
+            let reclaimed: Vec<IngressId> = to_reclaim
+                .iter()
+                .copied()
+                .filter(|id| {
+                    self.ingress_register
+                        .remove_if_disconnected(*id)
+                        .is_some()
+                })
+                .collect();
+            if !reclaimed.is_empty() {
+                self.remove_for_ingresses(&reclaimed);
+                info!(
+                    "rib GC: reclaimed {} BMP peer(s) idle (Disconnected) \
+                     for >= one GC interval",
+                    reclaimed.len()
+                );
             }
-            info!(
-                "rib GC: reclaimed {} BMP peer(s) idle (Disconnected) for \
-                 >= one GC interval",
-                to_reclaim.len()
-            );
         }
 
         // Reclaimed ids are now gone from the register, so they won't appear

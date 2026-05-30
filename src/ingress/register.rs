@@ -409,6 +409,30 @@ impl Register {
         self.info.write().unwrap().remove(&id)
     }
 
+    /// Remove an ingress entry only if it is currently `Disconnected`.
+    ///
+    /// Returns the removed [`IngressInfo`] when the entry was present and in
+    /// the `Disconnected` state, or `None` if it was absent or in any other
+    /// state. The state check and the removal happen under a single write
+    /// lock, so this is the safe reclaim step for a snapshot-then-remove GC
+    /// sweep: a peer that reconnected and flipped its id back to `Connected`
+    /// in the window since the snapshot is left untouched, rather than having
+    /// its live registration deleted out from under it.
+    pub fn remove_if_disconnected(
+        &self,
+        id: IngressId,
+    ) -> Option<IngressInfo> {
+        let mut lock = self.info.write().unwrap();
+        match lock.get(&id) {
+            Some(info)
+                if info.state == Some(IngressState::Disconnected) =>
+            {
+                lock.remove(&id)
+            }
+            _ => None,
+        }
+    }
+
     /// Search for an existing BGP session by remote address, ASN, and ingress type
     ///
     /// Unlike [`find_existing_peer`], this does not require `parent_ingress`
