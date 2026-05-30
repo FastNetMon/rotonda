@@ -220,8 +220,18 @@ impl Processor {
                             let _ = self.tx.send(Command::Disconnect(
                                     DisconnectReason::Shutdown
                             )).await;
-                            debug!("TODO send Payload::bgp_eof");
-                            //break;
+                            // Exit the loop. Once the gate's command channel is
+                            // closed, process() returns Err(Terminated)
+                            // immediately on every poll, and a Disconnect does
+                            // NOT make routecore's FSM emit ConnectionLost (that
+                            // only follows TCP EOF). Without this break the
+                            // select! hot-spins at ~100% CPU re-sending
+                            // Disconnect (and inflating the disconnect metric)
+                            // for the life of the connection -- on app shutdown
+                            // and on any reconfigure that removes this unit. The
+                            // post-loop cleanup below still withdraws this
+                            // session's routes.
+                            break;
                         }
                         Ok(status) => match status {
                             GateStatus::Reconfiguring {
@@ -895,50 +905,35 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn processor_should_abort_on_unit_termination() {
         enable_logging("trace");
-        let (join_handle, status_reporter, gate_agent, sess_tx) =
+        let (join_handle, status_reporter, gate_agent, _sess_tx) =
             setup_test();
 
         gate_agent.terminate().await;
 
-        // We should be able to just wait for the processor to abort but it
-        // doesn't... because the mock session doesn't respond to the
-        // Disconnect command that gets sent to which it would in turn send
-        // a ConnectionLost message. However we still want to test unit
-        // termination because it should also increment the disconnect metric
-        // while sending only the ConnectionLost message does not.
-        // join_handle.await.unwrap();
-
+        // On unit termination the processor now breaks out of its loop
+        // directly: a Disconnect command does not make the FSM emit
+        // ConnectionLost (that only follows TCP EOF), so previously the loop
+        // hot-spun until a ConnectionLost was injected. It still increments
+        // the disconnect metric before exiting (guarded by
+        // session.connected_addr() being Some), so no ConnectionLost
+        // injection is needed for the task to finish.
+        //
         // Note: the disconnect metric is only incremented if both
         // session.negotiated() and session.connected_addr() return Some.
-
-        // Wait for the termination command to be handled:
-        let mut count = 0;
-        while count < 1 {
-            let metrics = get_testable_metrics_snapshot(
-                &status_reporter.metrics().unwrap(),
-            );
-            count = metrics.with_name::<usize>("bgp_tcp_in_disconnect_count");
-        }
-
-        // Emulate the real session behaviour of sending a ConnectionLost
-        // message.
-        let msg =
-            Message::ConnectionLost(Some("10.0.0.2:12345".parse().unwrap()));
-        let _ = sess_tx.send(msg).await;
-
-        // Now it's safe to wait for the processor to abort.
         join_handle.await.unwrap();
 
         let metrics = get_testable_metrics_snapshot(
             &status_reporter.metrics().unwrap(),
         );
         assert_eq!(
-            metrics.with_name::<usize>("bgp_tcp_in_connection_lost_count"),
-            1
-        );
-        assert_eq!(
             metrics.with_name::<usize>("bgp_tcp_in_disconnect_count"),
             1
+        );
+        // The processor exits without processing a ConnectionLost on the
+        // termination path.
+        assert_eq!(
+            metrics.with_name::<usize>("bgp_tcp_in_connection_lost_count"),
+            0
         );
     }
 
