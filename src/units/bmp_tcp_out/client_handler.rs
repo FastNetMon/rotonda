@@ -426,12 +426,15 @@ pub async fn perform_initial_dump(
         drop(phase); // release before slow sends; new DU calls re-buffer
 
         for update in buffered {
+            // Per-client dump task: blocking send is correct here (only this
+            // client's own task is back-pressured).
             if !send_update_to_client(
                 client,
                 &update,
                 ingress_register,
                 forward_router_info,
                 fan_in_peer_distinguisher,
+                true,
             )
             .await
             {
@@ -447,12 +450,18 @@ pub async fn perform_initial_dump(
 /// Convert an Update to BMP messages and send to a single client.
 ///
 /// Returns false if the send failed (client disconnected).
+///
+/// `blocking` is threaded down to the per-message send: `true` for the
+/// per-client dump / buffered-replay tasks, `false` for the shared live
+/// `direct_update` path (which must not park the ingest pipeline on a slow
+/// consumer — see [`ClientState::send_message_mode`]).
 pub async fn send_update_to_client(
     client: &Arc<ClientState>,
     update: &Update,
     ingress_register: &Arc<register::Register>,
     forward_router_info: bool,
     fan_in_peer_distinguisher: FanInPeerDistinguisher,
+    blocking: bool,
 ) -> bool {
     match update {
         Update::Single(payload) => {
@@ -462,6 +471,7 @@ pub async fn send_update_to_client(
                 ingress_register,
                 forward_router_info,
                 fan_in_peer_distinguisher,
+                blocking,
             )
             .await
         }
@@ -473,6 +483,7 @@ pub async fn send_update_to_client(
                     ingress_register,
                     forward_router_info,
                     fan_in_peer_distinguisher,
+                    blocking,
                 )
                 .await
                 {
@@ -489,6 +500,7 @@ pub async fn send_update_to_client(
                 ingress_register,
                 forward_router_info,
                 fan_in_peer_distinguisher,
+                blocking,
             )
             .await
         }
@@ -501,6 +513,7 @@ pub async fn send_update_to_client(
                     ingress_register,
                     forward_router_info,
                     fan_in_peer_distinguisher,
+                    blocking,
                 )
                 .await
                 {
@@ -516,6 +529,7 @@ pub async fn send_update_to_client(
                 ingress_register,
                 forward_router_info,
                 fan_in_peer_distinguisher,
+                blocking,
             )
             .await
         }
@@ -527,6 +541,7 @@ pub async fn send_update_to_client(
                 ingress_register,
                 forward_router_info,
                 fan_in_peer_distinguisher,
+                blocking,
             )
             .await
         }
@@ -549,6 +564,7 @@ async fn send_peer_stats(
     ingress_register: &Arc<register::Register>,
     forward_router_info: bool,
     fan_in_peer_distinguisher: FanInPeerDistinguisher,
+    blocking: bool,
 ) -> bool {
     if client.register_known_peer_if_absent(ingress_id).await {
         if let Some(info) = ingress_register.get(ingress_id) {
@@ -559,7 +575,7 @@ async fn send_peer_stats(
                 fan_in_peer_distinguisher,
             );
             let peer_up = bmp_builder::build_peer_up(&peer_info, false);
-            if !client.send_message(peer_up).await {
+            if !client.send_message_mode(peer_up, blocking).await {
                 client.remove_known_peer(ingress_id).await;
                 return false;
             }
@@ -581,7 +597,7 @@ async fn send_peer_stats(
     };
 
     let msg = bmp_builder::build_statistics_report(&peer_info, body);
-    client.send_message(msg).await
+    client.send_message_mode(msg, blocking).await
 }
 
 /// Send a single Payload as a Route Monitoring BMP message.
@@ -591,6 +607,7 @@ async fn send_payload_to_client(
     ingress_register: &Arc<register::Register>,
     forward_router_info: bool,
     fan_in_peer_distinguisher: FanInPeerDistinguisher,
+    blocking: bool,
 ) -> bool {
     let ingress_id = payload.ingress_id;
 
@@ -604,7 +621,7 @@ async fn send_payload_to_client(
                 fan_in_peer_distinguisher,
             );
             let peer_up = bmp_builder::build_peer_up(&peer_info, false);
-            if !client.send_message(peer_up).await {
+            if !client.send_message_mode(peer_up, blocking).await {
                 client.remove_known_peer(ingress_id).await;
                 return false;
             }
@@ -662,6 +679,7 @@ async fn send_peer_down(
     ingress_register: &Arc<register::Register>,
     forward_router_info: bool,
     fan_in_peer_distinguisher: FanInPeerDistinguisher,
+    blocking: bool,
 ) -> bool {
     if !client.has_known_peer(ingress_id).await {
         return true; // Client doesn't know about this peer, nothing to do
@@ -694,7 +712,7 @@ async fn send_peer_down(
     };
 
     let msg = bmp_builder::build_peer_down(&peer_info);
-    let sent = client.send_message(msg).await;
+    let sent = client.send_message_mode(msg, blocking).await;
 
     client.remove_known_peer(ingress_id).await;
 
@@ -708,6 +726,7 @@ async fn send_peer_reappeared(
     ingress_register: &Arc<register::Register>,
     forward_router_info: bool,
     fan_in_peer_distinguisher: FanInPeerDistinguisher,
+    blocking: bool,
 ) -> bool {
     if let Some(info) = ingress_register.get(ingress_id) {
         let peer_info = build_peer_info_for_emit(
@@ -721,7 +740,7 @@ async fn send_peer_reappeared(
         if client.register_known_peer_if_absent(ingress_id).await {
             // Send Peer Up
             let peer_up = bmp_builder::build_peer_up(&peer_info, false);
-            if !client.send_message(peer_up).await {
+            if !client.send_message_mode(peer_up, blocking).await {
                 client.remove_known_peer(ingress_id).await;
                 return false;
             }

@@ -152,15 +152,58 @@ impl ClientState {
         std::mem::take(&mut *buf)
     }
 
-    /// Send a BMP message to this client.
-    pub async fn send_message(&self, msg: Vec<u8>) -> bool {
+    /// Send a BMP message to this client's writer task.
+    ///
+    /// `blocking` selects the backpressure policy:
+    ///
+    /// * `true` — used by the per-client dump and buffered-replay paths, which
+    ///   run on the client's own task: awaiting the bounded channel applies
+    ///   natural backpressure to just that task.
+    /// * `false` — used by the shared live `direct_update` path. That path
+    ///   runs inline on the ingest pipeline (the gate awaits it, and the RIB
+    ///   and bmp-in await the gate in turn), so it must never park on one slow
+    ///   consumer's TCP throughput — doing so head-of-line-blocks every other
+    ///   client and freezes route ingestion process-wide. On a full queue the
+    ///   client is flagged for disconnect (the same policy as a dump-phase
+    ///   buffer overflow) and the message is dropped; the client will
+    ///   reconnect and re-dump.
+    pub async fn send_message_mode(
+        &self,
+        msg: Vec<u8>,
+        blocking: bool,
+    ) -> bool {
         let len = msg.len();
-        if self.tx.send(msg).await.is_ok() {
+        let sent = if blocking {
+            self.tx.send(msg).await.is_ok()
+        } else {
+            match self.tx.try_send(msg) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.request_disconnect();
+                    false
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            }
+        };
+        if sent {
             self.messages_sent.fetch_add(1, Ordering::Relaxed);
             self.bytes_sent.fetch_add(len, Ordering::Relaxed);
-            true
-        } else {
-            false
+        }
+        sent
+    }
+
+    /// Blocking send, for per-client tasks (dump / buffered replay). See
+    /// [`send_message_mode`](Self::send_message_mode).
+    pub async fn send_message(&self, msg: Vec<u8>) -> bool {
+        self.send_message_mode(msg, true).await
+    }
+
+    /// Flag this client for disconnect and wake its writer task. Idempotent:
+    /// the first caller wins the CAS and fires the notify exactly once, so
+    /// concurrent overflow / live-backpressure events don't double-signal.
+    pub fn request_disconnect(&self) {
+        if !self.disconnect_pending.swap(true, Ordering::SeqCst) {
+            self.disconnect_notify.notify_one();
         }
     }
 

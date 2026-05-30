@@ -329,13 +329,17 @@ impl DirectUpdate for BmpTcpOutRunner {
                     }
                 }
                 BufferUpdateResult::NotDumping => {
-                    // Live phase — send directly
+                    // Live phase — send directly. `blocking = false`: this runs
+                    // inline on the shared ingest pipeline (the gate awaits
+                    // `direct_update`), so a slow consumer must be flagged for
+                    // disconnect rather than parking the whole pipeline.
                     if !client_handler::send_update_to_client(
                         client,
                         &update,
                         &self.ingress_register,
                         self.forward_router_info,
                         self.fan_in_peer_distinguisher,
+                        false,
                     )
                     .await
                     {
@@ -719,12 +723,15 @@ impl BmpTcpOutRunner {
                     let mut phase = client.phase.write().await;
                     let buffered = client.take_buffered_updates().await;
                     for update in buffered {
+                        // Per-client task replaying buffered updates: blocking
+                        // send is correct (only this task is back-pressured).
                         if !client_handler::send_update_to_client(
                             &client,
                             &update,
                             &ingress_register,
                             forward_router_info,
                             fan_in_peer_distinguisher,
+                            true,
                         )
                         .await
                         {
