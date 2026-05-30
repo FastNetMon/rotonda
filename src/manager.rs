@@ -625,11 +625,34 @@ impl Manager {
             return Ok(());
         };
 
-        let i = roto::FileTree::read(path);
-        // .map_err(|e| e.to_string())?;
-        let roto_package = i
-            .compile(&create_runtime().unwrap())
-            .map_err(|e| e.to_string())?;
+        // roto 0.7.1's `FileTree::read` / `SourceFile::read` are unwrap-based
+        // internally (`path.metadata().unwrap()`, `read_to_string(path)
+        // .unwrap()`), so any I/O problem — a missing/typo'd path, a
+        // permissions error, or a delete/rename race — panics instead of
+        // returning an error. On the SIGHUP reload path this runs under
+        // `block_on` on the main thread and would tear down a live,
+        // route-carrying engine. Pre-validate for a clean error in the common
+        // case, and wrap the read in `catch_unwind` as a backstop so no
+        // residual I/O panic can escape and crash the process.
+        std::fs::metadata(path).map_err(|e| {
+            format!("cannot read roto script path '{}': {e}", path.display())
+        })?;
+
+        let runtime = create_runtime()
+            .map_err(|e| format!("failed to build roto runtime: {e}"))?;
+
+        let file_tree =
+            std::panic::catch_unwind(|| roto::FileTree::read(path)).map_err(
+                |_| {
+                    format!(
+                        "failed to read roto script path '{}'",
+                        path.display()
+                    )
+                },
+            )?;
+
+        let roto_package =
+            file_tree.compile(&runtime).map_err(|e| e.to_string())?;
 
         self.roto_package = Some(Arc::new(Mutex::new(roto_package)));
         Ok(())
