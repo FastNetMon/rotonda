@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, Notify, RwLock};
 use uuid::Uuid;
 
+use super::bmp_builder::PeerInfo;
 use crate::ingress::IngressId;
 use crate::payload::Update;
 
@@ -49,6 +50,14 @@ pub struct ClientState {
 
     /// Set of peer IngressIds that this client knows about (has received Peer Up for).
     pub known_peers: RwLock<HashSet<IngressId>>,
+
+    /// Per-client cache of the immutable per-peer BMP header info, keyed by
+    /// IngressId. `PeerInfo` is constant for the life of a peer's session, so
+    /// the live forwarding path builds it once (2-3 register `IngressInfo`
+    /// clones + an admin-label String) and reuses it for every subsequent
+    /// route instead of rebuilding per route. Invalidated alongside
+    /// `known_peers` in `remove_known_peer` (Peer Down / reappear).
+    peer_info_cache: RwLock<HashMap<IngressId, Arc<PeerInfo>>>,
 
     /// When this client connected.
     pub connected_at: DateTime<Utc>,
@@ -101,6 +110,7 @@ impl ClientState {
             tx,
             dump_buffer: tokio::sync::Mutex::new(Vec::new()),
             known_peers: RwLock::new(HashSet::new()),
+            peer_info_cache: RwLock::new(HashMap::new()),
             connected_at: Utc::now(),
             messages_sent: AtomicUsize::new(0),
             bytes_sent: AtomicUsize::new(0),
@@ -220,14 +230,37 @@ impl ClientState {
         self.known_peers.write().await.insert(ingress_id)
     }
 
-    /// Remove a peer from the known peers set.
+    /// Remove a peer from the known peers set and drop its cached `PeerInfo`,
+    /// so a later Peer Up (reconnect / reappear) rebuilds the header from the
+    /// current register state.
     pub async fn remove_known_peer(&self, ingress_id: IngressId) -> bool {
+        self.peer_info_cache.write().await.remove(&ingress_id);
         self.known_peers.write().await.remove(&ingress_id)
     }
 
     /// Check if a peer is known to this client.
     pub async fn has_known_peer(&self, ingress_id: IngressId) -> bool {
         self.known_peers.read().await.contains(&ingress_id)
+    }
+
+    /// Return the cached per-peer `PeerInfo` for this client, if present.
+    pub async fn cached_peer_info(
+        &self,
+        ingress_id: IngressId,
+    ) -> Option<Arc<PeerInfo>> {
+        self.peer_info_cache.read().await.get(&ingress_id).cloned()
+    }
+
+    /// Cache the per-peer `PeerInfo` for this client.
+    pub async fn cache_peer_info(
+        &self,
+        ingress_id: IngressId,
+        peer_info: Arc<PeerInfo>,
+    ) {
+        self.peer_info_cache
+            .write()
+            .await
+            .insert(ingress_id, peer_info);
     }
 }
 

@@ -616,7 +616,25 @@ async fn send_payload_to_client(
 ) -> bool {
     let ingress_id = payload.ingress_id;
 
-    // Ensure we have sent Peer Up for this peer
+    // Fast path: PeerInfo is constant per peer for the session, so once it is
+    // cached (Peer Up already sent, header already built) every subsequent
+    // route just reuses it -- no register lookups, no IngressInfo clones, no
+    // per-route known_peers write-lock.
+    if let Some(peer_info) = client.cached_peer_info(ingress_id).await {
+        let is_withdrawal = payload.route_status == RouteStatus::Withdrawn;
+        return match bmp_builder::build_route_monitoring_from_route(
+            &peer_info,
+            &payload.rx_value,
+            is_withdrawal,
+        ) {
+            Some(msg) => client.send_message_mode(msg, blocking).await,
+            None => true, // Skip if we can't build the message
+        };
+    }
+
+    // Cache miss (first route for this peer on this client). This block is the
+    // legacy first-sight path verbatim -- ensure Peer Up has been sent -- and
+    // is followed by caching the built PeerInfo for the fast path above.
     if client.register_known_peer_if_absent(ingress_id).await {
         if let Some(info) = ingress_register.get(ingress_id) {
             let peer_info = build_peer_info_for_emit(
@@ -633,10 +651,9 @@ async fn send_payload_to_client(
         }
     }
 
-    // Build and send Route Monitoring message. The fan-in distinguisher
-    // tag must match the Peer Up we sent for this peer, so use the same
-    // builder.
-    let peer_info = match ingress_register.get(ingress_id) {
+    // Build the Route Monitoring peer header. The fan-in distinguisher tag
+    // must match the Peer Up we sent for this peer, so use the same builder.
+    let peer_info = Arc::new(match ingress_register.get(ingress_id) {
         Some(info) => build_peer_info_for_emit(
             &info,
             ingress_register,
@@ -656,7 +673,14 @@ async fn send_payload_to_client(
                 fan_in_peer_distinguisher,
             )
         }
-    };
+    });
+
+    // Cache only when the peer is actually registered, so the rare
+    // route-before-register race re-resolves on the next route instead of
+    // sticking with the default header.
+    if ingress_register.get(ingress_id).is_some() {
+        client.cache_peer_info(ingress_id, peer_info.clone()).await;
+    }
 
     let is_withdrawal = payload.route_status == RouteStatus::Withdrawn;
     if let Some(msg) = bmp_builder::build_route_monitoring_from_route(
