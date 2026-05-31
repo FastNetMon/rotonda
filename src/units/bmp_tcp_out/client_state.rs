@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use super::bmp_builder::PeerInfo;
 use crate::ingress::IngressId;
+use crate::mem_stats;
 use crate::payload::Update;
 
 /// Phase of a connected BMP client.
@@ -103,6 +104,7 @@ impl ClientState {
         max_buffer_entries: usize,
         max_buffer_bytes: usize,
     ) -> Self {
+        mem_stats::BMP_OUT_CLIENTS.fetch_add(1, Ordering::Relaxed);
         Self {
             id: Uuid::new_v4(),
             remote_addr,
@@ -152,14 +154,44 @@ impl ClientState {
         buf.push(update);
         self.buffered_bytes
             .fetch_add(upd_bytes, Ordering::Relaxed);
+        // Mirror into the process-wide bmp-out accounting (see mem_stats).
+        mem_stats::BMP_OUT_BUFFERED_BYTES
+            .fetch_add(upd_bytes, Ordering::Relaxed);
+        mem_stats::BMP_OUT_BUFFERED_ENTRIES.fetch_add(1, Ordering::Relaxed);
         BufferUpdateResult::Buffered
     }
 
     /// Take all buffered updates (drain the buffer).
     pub async fn take_buffered_updates(&self) -> Vec<Update> {
         let mut buf = self.dump_buffer.lock().await;
-        self.buffered_bytes.store(0, Ordering::Relaxed);
+        let bytes = self.buffered_bytes.swap(0, Ordering::Relaxed);
+        let entries = buf.len();
+        mem_stats::BMP_OUT_BUFFERED_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+        mem_stats::BMP_OUT_BUFFERED_ENTRIES
+            .fetch_sub(entries, Ordering::Relaxed);
         std::mem::take(&mut *buf)
+    }
+
+    /// Discard all buffered dump-phase updates and free their backing
+    /// allocation immediately, resetting the byte counter.
+    ///
+    /// Used on the disconnect path: a client flagged for disconnect (e.g.
+    /// dump-buffer overflow) is torn down and re-dumped on reconnect, so the
+    /// buffered live updates are worthless. Dropping them here frees up to
+    /// `max_buffer_bytes` (hundreds of MB on a busy box) right away, rather
+    /// than leaving the buffer pinned until the last `Arc<ClientState>` is
+    /// dropped — which can lag the overflow by the time it takes the blocking
+    /// RIB walker to notice its receiver was dropped and unwind.
+    pub async fn discard_dump_buffer(&self) {
+        let mut buf = self.dump_buffer.lock().await;
+        let bytes = self.buffered_bytes.swap(0, Ordering::Relaxed);
+        let entries = buf.len();
+        mem_stats::BMP_OUT_BUFFERED_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+        mem_stats::BMP_OUT_BUFFERED_ENTRIES
+            .fetch_sub(entries, Ordering::Relaxed);
+        // Replace with an empty Vec (not `clear()`) so the potentially large
+        // backing allocation is returned now, not merely emptied-but-retained.
+        *buf = Vec::new();
     }
 
     /// Send a BMP message to this client's writer task.
@@ -261,6 +293,27 @@ impl ClientState {
             .write()
             .await
             .insert(ingress_id, peer_info);
+    }
+}
+
+impl Drop for ClientState {
+    fn drop(&mut self) {
+        // Decrement the process-wide bmp-out accounting for whatever this
+        // client still holds. On the normal paths take/discard already zeroed
+        // these (so this subtracts 0); this covers the abnormal drop — the
+        // last `Arc<ClientState>` released mid-dump without a drain — so the
+        // global counters never drift upward on client churn.
+        let bytes = *self.buffered_bytes.get_mut();
+        if bytes != 0 {
+            mem_stats::BMP_OUT_BUFFERED_BYTES
+                .fetch_sub(bytes, Ordering::Relaxed);
+        }
+        let entries = self.dump_buffer.get_mut().len();
+        if entries != 0 {
+            mem_stats::BMP_OUT_BUFFERED_ENTRIES
+                .fetch_sub(entries, Ordering::Relaxed);
+        }
+        mem_stats::BMP_OUT_CLIENTS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

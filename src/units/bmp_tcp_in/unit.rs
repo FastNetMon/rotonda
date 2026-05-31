@@ -15,6 +15,7 @@ use futures::{future::select, pin_mut, Future};
 use log::{debug, warn};
 use routecore::bmp::message::Message as BmpMessage;
 use serde::Deserialize;
+use socket2::{SockRef, TcpKeepalive};
 use serde_with::{serde_as, DisplayFromStr};
 use tokio::{
     sync::{Mutex, RwLock},
@@ -53,6 +54,23 @@ use super::{
     state_machine::{BmpState, BmpStateMachineMetrics},
     types::RouterInfo,
 };
+
+/// TCP keepalive idle time before the first probe is sent on an accepted BMP
+/// exporter connection.
+///
+/// A half-open exporter (silent NAT/conntrack timeout, firewall drop, or a
+/// yanked link that sends no FIN/RST) otherwise blocks the read loop forever,
+/// leaving its router and every child peer stuck `Connected` in the ingress
+/// register. Such entries are never reclaimed by the rib GC (it only sweeps
+/// `Disconnected` peers), so their RIB records leak ~1 slot per prefix, and
+/// they are never reuse-matchable on reconnect (a fresh mui then starts a
+/// second full copy of the table). Keepalive lets the kernel reset the dead
+/// socket, surfacing as EOF in the read loop so the existing teardown
+/// (`disconnect_into_register`) runs and the records become reclaimable.
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+
+/// Interval between TCP keepalive probes once they start.
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 //-------- BmpIn -------------------------------------------------------------
 
@@ -627,6 +645,25 @@ impl ConfigAcceptor for BmpTcpInRunner {
 
         // SAFETY: StandardTcpStream::into_inner() always returns Ok(...)
         let tcp_stream = tcp_stream.into_inner().unwrap();
+
+        // Enable TCP keepalive so a half-open exporter is eventually reset by
+        // the kernel instead of pinning its router + peers as `Connected`
+        // forever (which leaks their RIB records past the GC). The reset
+        // surfaces as EOF in `read_from_router`, driving the normal teardown.
+        // See TCP_KEEPALIVE_IDLE.
+        {
+            let ka = TcpKeepalive::new()
+                .with_time(TCP_KEEPALIVE_IDLE)
+                .with_interval(TCP_KEEPALIVE_INTERVAL);
+            if let Err(e) =
+                SockRef::from(&tcp_stream).set_tcp_keepalive(&ka)
+            {
+                debug!(
+                    "bmp-in: failed to set TCP keepalive for {}: {}",
+                    client_addr, e
+                );
+            }
+        }
 
         crate::tokio::spawn(&child_name, async move {
             // run() returns the id the connection settled on: the provisional

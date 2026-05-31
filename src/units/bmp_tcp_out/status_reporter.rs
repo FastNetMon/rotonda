@@ -69,6 +69,7 @@ impl BmpTcpOutStatusReporter {
         sr_log!(warn: self, "Error while listening for connections: {}", err);
     }
 
+    #[allow(dead_code)]
     pub fn internal_error<T: Display>(&self, err: T) {
         sr_log!(error: self, "Internal error: {}", err);
     }

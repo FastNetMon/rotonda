@@ -454,6 +454,7 @@ pub trait PeerAware {
         tlv_iter: InformationTlvIter,
     ) -> (bool, Option<IngressId>);
 
+    #[allow(dead_code)]
     fn get_peers(&self) -> Keys<'_, PerPeerHeader<Bytes>, PeerState>;
 
     /// Remove every remaining PeerState whose peer identity matches

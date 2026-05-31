@@ -10,6 +10,7 @@ pub mod http_ng;
 pub mod ingress;
 pub mod log;
 pub mod manager;
+pub mod mem_stats;
 pub mod metrics;
 pub mod payload;
 pub mod roto_runtime;

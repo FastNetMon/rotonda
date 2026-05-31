@@ -28,6 +28,19 @@ pub struct Register {
 }
 
 pub type IngressId = u32;
+
+/// Breakdown of the ingress register by entry state, for memory reporting.
+/// Produced by [`Register::memory_summary`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RegisterMemSummary {
+    pub total: usize,
+    pub connected: usize,
+    pub disconnected: usize,
+    pub non_network: usize,
+    pub state_unset: usize,
+    pub bgp_via_bmp: usize,
+}
+
 #[derive(serde::Serialize)]
 pub struct IdAndInfo<'a> {
     #[serde(rename = "id")]
@@ -258,6 +271,34 @@ impl Register {
 
     pub fn cloned_info(&self) -> HashMap<IngressId, IngressInfo> {
         self.info.read().unwrap().clone()
+    }
+
+    /// Tally the register for memory reporting, locking once and counting in
+    /// place (no clone of the map). Returns total entries, a breakdown by
+    /// state, and the number of `BgpViaBmp` entries (the synthesized BMP peers
+    /// that dominate the RIB and are the prime leak suspects).
+    ///
+    /// A `connected` count that keeps climbing past the number of peers that
+    /// are really live is the fingerprint of the half-open-exporter leak:
+    /// stuck-`Connected` entries are never GC-reclaimed.
+    pub fn memory_summary(&self) -> RegisterMemSummary {
+        let lock = self.info.read().unwrap();
+        let mut s = RegisterMemSummary {
+            total: lock.len(),
+            ..Default::default()
+        };
+        for info in lock.values() {
+            match info.state {
+                Some(IngressState::Connected) => s.connected += 1,
+                Some(IngressState::Disconnected) => s.disconnected += 1,
+                Some(IngressState::NonNetwork) => s.non_network += 1,
+                None => s.state_unset += 1,
+            }
+            if info.ingress_type == Some(IngressType::BgpViaBmp) {
+                s.bgp_via_bmp += 1;
+            }
+        }
+        s
     }
 
     pub fn bgp_neighbors<T>(&self, mut target: T) -> fmt::Result

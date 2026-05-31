@@ -103,6 +103,86 @@ impl Rib {
         }
     }
 
+    /// Emit a consolidated snapshot of the main memory consumers to the log,
+    /// for leak hunting. Cheap: store counters are atomic loads, the interner
+    /// scan and register tally lock briefly. Intended to be called on a slow
+    /// timer (every few minutes), not on any hot path.
+    ///
+    /// What to watch:
+    /// * `routes/variants` climbing while `prefixes` is flat (a rising
+    ///   variants-per-prefix ratio) ⇒ dead per-mui route slots not being
+    ///   physically reclaimed — the RIB leak.
+    /// * `ingress connected` climbing past the count of genuinely live peers ⇒
+    ///   stuck-`Connected` half-open exporters that GC can never reclaim.
+    /// * `bmp-out buffered` large/growing ⇒ a slow consumer's dump backlog.
+    /// * `RSS` is the bottom line — cross-check it against the sum of the above
+    ///   to see whether the leak is accounted for here or somewhere unmeasured.
+    pub fn report_memory(&self) {
+        use crate::mem_stats::{
+            bmp_out_snapshot, fmt_bytes, fmt_count, read_rss_bytes,
+        };
+
+        let rss = read_rss_bytes()
+            .map(fmt_bytes)
+            .unwrap_or_else(|| "n/a".to_string());
+        let bmp = bmp_out_snapshot();
+        info!(
+            "memstat: RSS={rss} | bmp-out clients={} buffered={} ({} entries)",
+            bmp.clients,
+            fmt_bytes(bmp.buffered_bytes),
+            fmt_count(bmp.buffered_entries),
+        );
+
+        for (label, store) in [
+            ("unicast", self.unicast.as_ref()),
+            ("multicast", self.multicast.as_ref()),
+        ] {
+            let Some(store) = store else {
+                continue;
+            };
+            let prefixes = store.prefixes_count().in_memory();
+            let v4 = store.prefixes_v4_count().in_memory();
+            let v6 = store.prefixes_v6_count().in_memory();
+            let routes = store.routes_count().in_memory();
+            let nodes = store.nodes_count();
+            let per_prefix = if prefixes > 0 {
+                routes as f64 / prefixes as f64
+            } else {
+                0.0
+            };
+            info!(
+                "memstat: {label} prefixes={} (v4 {} / v6 {}) \
+                 routes/variants={} ({per_prefix:.1}/prefix) nodes={}",
+                fmt_count(prefixes),
+                fmt_count(v4),
+                fmt_count(v6),
+                fmt_count(routes),
+                fmt_count(nodes),
+            );
+        }
+
+        let (buckets, weak_slots, live_blobs) =
+            self.path_attribute_interner.stats();
+        info!(
+            "memstat: pa-interner buckets={} weak_slots={} live_blobs={}",
+            fmt_count(buckets),
+            fmt_count(weak_slots),
+            fmt_count(live_blobs),
+        );
+
+        let reg = self.ingress_register.memory_summary();
+        info!(
+            "memstat: ingress total={} connected={} disconnected={} \
+             non_network={} unset={} (BgpViaBmp {})",
+            reg.total,
+            reg.connected,
+            reg.disconnected,
+            reg.non_network,
+            reg.state_unset,
+            reg.bgp_via_bmp,
+        );
+    }
+
     pub fn insert(
         &self,
         val: &RotondaRoute,

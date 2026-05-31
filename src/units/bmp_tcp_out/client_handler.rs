@@ -340,6 +340,16 @@ pub async fn perform_initial_dump(
             tokio::task::yield_now().await;
             since_yield = 0;
 
+            // Stop forwarding to a client already flagged for disconnect
+            // (e.g. a dump-buffer overflow tripped in `direct_update` while
+            // this walk was still streaming, or a live-path backpressure
+            // failure). Bailing here lets the eager buffer release below run
+            // without waiting for the next `send_message` to fail.
+            if client.disconnect_pending.load(Ordering::Relaxed) {
+                client_disconnected = true;
+                break;
+            }
+
             let now = Instant::now();
             if now.duration_since(last_progress_at) >= PROGRESS_LOG_EVERY {
                 let interval = now.duration_since(last_progress_at);
@@ -373,6 +383,19 @@ pub async fn perform_initial_dump(
         }
     }
     drop(msg_rx);
+
+    // If the client went away mid-walk (overflow flagged it for disconnect,
+    // or a send failed), free the buffered live updates now. They are
+    // discarded on reconnect re-dump anyway, but would otherwise stay pinned
+    // across `walk_handle.await` below — the blocking walker only notices its
+    // dropped receiver on its next send — and the subsequent
+    // `Arc<ClientState>` teardown. On a large dump that buffer can hold
+    // hundreds of MB. `request_disconnect()` first so `direct_update` stops
+    // re-buffering into it before we clear.
+    if client_disconnected {
+        client.request_disconnect();
+        client.discard_dump_buffer().await;
+    }
 
     // Wait for the walker to finish so the epoch guard is released
     // before we proceed (and for the side-channel counters).

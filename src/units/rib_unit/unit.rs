@@ -602,6 +602,38 @@ impl RibUnitRunner {
             });
         }
 
+        // Periodic memory report: log a consolidated snapshot of the main
+        // memory consumers (RIB store variants/prefixes/nodes, path-attribute
+        // interner, ingress register state breakdown, bmp-out dump buffers,
+        // process RSS) so a leak can be attributed to a consumer rather than
+        // just observed as RSS growth. A `Weak` handle lets the task exit when
+        // the unit is torn down; the snapshot runs on the blocking pool since
+        // it briefly locks the interner shards and the register.
+        {
+            let stats_rib = Arc::downgrade(&arc_self.rib);
+            crate::tokio::spawn(&"rib-memstat".to_string(), async move {
+                const MEMSTAT_INTERVAL: std::time::Duration =
+                    std::time::Duration::from_secs(300);
+                let mut interval =
+                    tokio::time::interval(MEMSTAT_INTERVAL);
+                loop {
+                    interval.tick().await;
+                    let Some(rib_swap) = stats_rib.upgrade() else {
+                        break; // rib unit gone; stop reporting
+                    };
+                    let rib = rib_swap.load().clone();
+                    drop(rib_swap);
+                    if let Err(e) = tokio::task::spawn_blocking(move || {
+                        rib.report_memory()
+                    })
+                    .await
+                    {
+                        error!("rib memstat task failed: {e}");
+                    }
+                }
+            });
+        }
+
         loop {
             match arc_self.gate.process().await {
                 Ok(status) => {

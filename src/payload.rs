@@ -202,6 +202,36 @@ impl PathAttributeInterner {
         entries.push(Arc::downgrade(&interned));
         interned
     }
+
+    /// Snapshot of interner occupancy, for memory reporting.
+    ///
+    /// Returns `(distinct_hash_buckets, weak_slots, live_blobs)`:
+    /// * `distinct_hash_buckets` — number of hash keys held across all shards;
+    /// * `weak_slots` — total `Weak` entries stored (includes dead ones that
+    ///   haven't been lazily pruned yet by `intern`);
+    /// * `live_blobs` — entries whose blob is still referenced somewhere (the
+    ///   real count of interned attribute blobs currently in use).
+    ///
+    /// A steadily growing gap between `weak_slots` and `live_blobs` would point
+    /// at dead `Weak`s piling up; a growing `live_blobs` points at genuine
+    /// attribute diversity held by the RIB.
+    pub fn stats(&self) -> (usize, usize, usize) {
+        let mut buckets = 0usize;
+        let mut weak_slots = 0usize;
+        let mut live = 0usize;
+        for shard in &self.shards {
+            let shard = shard.lock().unwrap();
+            buckets += shard.len();
+            for entries in shard.values() {
+                weak_slots += entries.len();
+                live += entries
+                    .iter()
+                    .filter(|w| w.strong_count() > 0)
+                    .count();
+            }
+        }
+        (buckets, weak_slots, live)
+    }
 }
 
 fn hash_bytes(raw: &[u8]) -> u64 {

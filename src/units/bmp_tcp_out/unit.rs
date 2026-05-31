@@ -78,6 +78,8 @@ pub struct BmpTcpOut {
 
     /// HTTP API path for client listing.
     #[serde(default = "BmpTcpOut::default_http_api_path")]
+    // Accepted from the config file for compatibility; not read at runtime.
+    #[allow(dead_code)]
     http_api_path: Arc<String>,
 
     /// BMP Initiation sysName TLV.
