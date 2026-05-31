@@ -735,7 +735,7 @@ impl AggGroup {
 /// dumping half-empty groups (which a flush-everything policy would do).
 pub struct RouteAggregator {
     groups: HashMap<(IngressId, bool, u64), AggGroup>,
-    peer_info: Arc<HashMap<IngressId, PeerInfo>>,
+    peer_info: HashMap<IngressId, PeerInfo>,
     buffered_bytes: usize,
     max_bytes: usize,
     // Diagnostics, so the dump can report whether aggregation hit the budget
@@ -747,7 +747,7 @@ pub struct RouteAggregator {
 impl RouteAggregator {
     pub fn new(
         max_bytes: usize,
-        peer_info: Arc<HashMap<IngressId, PeerInfo>>,
+        peer_info: HashMap<IngressId, PeerInfo>,
     ) -> Self {
         Self {
             groups: HashMap::new(),
@@ -757,6 +757,20 @@ impl RouteAggregator {
             groups_created: 0,
             budget_evictions: 0,
         }
+    }
+
+    /// Whether the given ingress is already a known peer in the map. The dump
+    /// walk uses this to decide if it must discover-and-insert a peer (active
+    /// routes in the store whose register entry wasn't enumerated) before
+    /// adding its routes.
+    pub fn has_peer(&self, id: IngressId) -> bool {
+        self.peer_info.contains_key(&id)
+    }
+
+    /// Insert a peer discovered mid-walk so its deferred (and immediate) emits
+    /// resolve the correct per-peer header.
+    pub fn insert_peer(&mut self, id: IngressId, info: PeerInfo) {
+        self.peer_info.insert(id, info);
     }
 
     /// `(groups_created, budget_evictions)` — number of distinct aggregation
@@ -775,11 +789,19 @@ impl RouteAggregator {
     pub fn add(
         &mut self,
         ingress_id: IngressId,
-        peer: &PeerInfo,
         prefix: Prefix,
         pamap: &RotondaPaMap,
         sink: &mut dyn FnMut(Vec<u8>, usize) -> bool,
     ) -> bool {
+        // The walk guarantees the peer is in the map before calling `add`
+        // (it discovers-and-inserts on miss). Resolve once for the
+        // immediate-emit cases; a missing entry means the caller violated
+        // that contract, so drop the route rather than panic.
+        let peer = match self.peer_info.get(&ingress_id) {
+            Some(pi) => pi.clone(),
+            None => return true,
+        };
+        let peer = &peer;
         let is_v4 = prefix.is_v4();
         let raw = pamap.as_ref();
         let blob = raw.get(2..).unwrap_or(&[]);
@@ -868,7 +890,6 @@ impl RouteAggregator {
             )
         });
 
-        let peer_info = self.peer_info.clone();
         // Evict down to half the budget so we don't re-trigger immediately on
         // the next route.
         let target = self.max_bytes / 2;
@@ -876,10 +897,13 @@ impl RouteAggregator {
             if self.buffered_bytes <= target {
                 break;
             }
+            // Take the group out first, then borrow `self.peer_info` for the
+            // lookup — split borrows so the owned (non-Arc) peer map needs no
+            // per-call clone.
             if let Some(group) = self.groups.remove(&k) {
                 self.buffered_bytes -= group.cost();
                 self.budget_evictions += 1;
-                if let Some(peer) = peer_info.get(&k.0) {
+                if let Some(peer) = self.peer_info.get(&k.0) {
                     if !group.emit(peer, sink) {
                         return false;
                     }
@@ -894,9 +918,13 @@ impl RouteAggregator {
         &mut self,
         sink: &mut dyn FnMut(Vec<u8>, usize) -> bool,
     ) -> bool {
-        let peer_info = self.peer_info.clone();
-        for (key, group) in self.groups.drain() {
-            if let Some(peer) = peer_info.get(&key.0) {
+        // Drain groups into a temporary so `self.peer_info` can be borrowed
+        // for the per-group lookup without conflicting with the drain (the
+        // peer map is now an owned HashMap, not a cheap-to-clone Arc).
+        let groups: Vec<((IngressId, bool, u64), AggGroup)> =
+            self.groups.drain().collect();
+        for (key, group) in groups {
+            if let Some(peer) = self.peer_info.get(&key.0) {
                 if !group.emit(peer, sink) {
                     self.buffered_bytes = 0;
                     return false;
@@ -1855,7 +1883,7 @@ mod tests {
         let mut peer_map: HashMap<IngressId, PeerInfo> = HashMap::new();
         peer_map.insert(7, peer.clone());
         let mut agg =
-            RouteAggregator::new(64 * 1024 * 1024, Arc::new(peer_map));
+            RouteAggregator::new(64 * 1024 * 1024, peer_map);
         {
             let mut sink = |m: Vec<u8>, n: usize| {
                 messages.push((m, n));
@@ -1872,7 +1900,7 @@ mod tests {
                     24,
                 )
                 .unwrap();
-                assert!(agg.add(7, &peer, p, &pamap, &mut sink));
+                assert!(agg.add(7, p, &pamap, &mut sink));
             }
             assert!(agg.flush_all(&mut sink));
         }
@@ -1902,7 +1930,7 @@ mod tests {
         let mut peer_map: HashMap<IngressId, PeerInfo> = HashMap::new();
         peer_map.insert(7, peer.clone());
         // Budget of 1 KiB forces frequent eviction.
-        let mut agg = RouteAggregator::new(1024, Arc::new(peer_map));
+        let mut agg = RouteAggregator::new(1024, peer_map);
         let mut total = 0usize;
         let mut evicted_within_limit = true;
         {
@@ -1929,7 +1957,7 @@ mod tests {
                 )
                 .unwrap();
                 let pamap = if i % 2 == 0 { &pamap_a } else { &pamap_b };
-                assert!(agg.add(7, &peer, p, pamap, &mut sink));
+                assert!(agg.add(7, p, pamap, &mut sink));
             }
             assert!(agg.flush_all(&mut sink));
         }

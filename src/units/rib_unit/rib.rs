@@ -232,6 +232,20 @@ impl Rib {
             && (store.mui_is_withdrawn_v4(mui) || store.mui_is_withdrawn_v6(mui))
         {
             self.mark_ingress_active(mui);
+            // FIX B: this is the reactivation path the synthesized CHILD peers
+            // take (not Update::IngressReappeared). The store is now active but
+            // the register may still hold the Disconnected state set on the
+            // previous teardown, which makes register-state-filtered consumers
+            // (bmp_tcp_out's full-RIB dump) skip this peer's active routes.
+            // Restore it to Connected. Guarded by the same withdrawn->active
+            // transition as `mark_ingress_active`, so it stays off the
+            // per-route hot path. `update_info` merges, so only state changes.
+            self.ingress_register.update_info(
+                mui,
+                ingress::IngressInfo::new().with_state(
+                    ingress::register::IngressState::Connected,
+                ),
+            );
         }
 
         let pubrec = Record::new(

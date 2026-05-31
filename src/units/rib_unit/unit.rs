@@ -751,6 +751,18 @@ impl RibUnitRunner {
             Update::IngressReappeared(ingress_id) => {
                 debug!("Got IngressReappeared for {ingress_id}");
                 self.mark_ingress_active_blocking(ingress_id).await;
+                // FIX B: the store was reactivated above, but the register may
+                // still carry the Disconnected state set on teardown. Restore
+                // it to Connected so consumers that enumerate peers by register
+                // state (e.g. bmp_tcp_out's dump) see this peer again. Mirrors
+                // the teardown's `update_info(.., with_state(Disconnected))`;
+                // `update_info` merges, so only the state field changes.
+                self.ingress_register.update_info(
+                    ingress_id,
+                    ingress::IngressInfo::new().with_state(
+                        ingress::register::IngressState::Connected,
+                    ),
+                );
                 self.gate.update_data(update).await;
             }
 

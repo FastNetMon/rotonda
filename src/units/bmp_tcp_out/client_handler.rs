@@ -211,22 +211,34 @@ pub async fn perform_initial_dump(
     // average BMP RouteMon size; small enough to apply backpressure
     // quickly, large enough to smooth over short writer hiccups.
     let rib_walk_start = Instant::now();
+    // Keep an Arc copy of the enumerated (Connected) peers for the post-walk
+    // EoR loop and the ZERO-ROUTE diagnostic. The aggregator OWNS its own
+    // mutable copy of the same map (passed by value below) so it can absorb
+    // peers discovered mid-walk; this Arc is the enumerated set only.
     let peer_info_arc: Arc<HashMap<IngressId, PeerInfo>> =
-        Arc::new(peer_info_map);
+        Arc::new(peer_info_map.clone());
     // Channel item is (message bytes, number of routes packed in it): with
     // NLRI aggregation one message may carry many prefixes, so the consumer
     // needs the route count to keep its progress accounting accurate.
     let (msg_tx, mut msg_rx) =
         tokio::sync::mpsc::channel::<(Vec<u8>, usize)>(1024);
     let rib_for_walk = rib.clone();
-    let peer_info_for_walk = peer_info_arc.clone();
+    // Captured by the blocking walk so a peer whose routes are ACTIVE in the
+    // store but whose register entry was NOT enumerated (e.g. reactivated on
+    // reconnect without the register state flipping back to Connected) can be
+    // discovered and emitted instead of silently dropped.
+    let ingress_register_for_walk = ingress_register.clone();
     let walk_handle = tokio::task::spawn_blocking(move || {
         let mut routes_per_ingress: HashMap<IngressId, usize> =
-            HashMap::with_capacity(peer_info_for_walk.len());
+            HashMap::with_capacity(peer_info_map.len());
         let mut skipped_unknown: HashMap<IngressId, usize> = HashMap::new();
+        // Peers found mid-walk via the register fallback (active routes but
+        // not in the enumerated set). Returned out so the async side can send
+        // their EoR markers and register them as known peers.
+        let mut discovered: Vec<(IngressId, PeerInfo)> = Vec::new();
         let mut aggregator = bmp_builder::RouteAggregator::new(
             DUMP_AGGREGATOR_MAX_BYTES,
-            peer_info_for_walk.clone(),
+            peer_info_map,
         );
         // Set if the consumer (client) goes away mid-walk, so we skip the
         // post-walk flush instead of re-encoding messages for a dead socket.
@@ -235,24 +247,49 @@ pub async fn perform_initial_dump(
             let prefix = pr.prefix;
             for route_record in pr.meta {
                 let ingress_id = route_record.multi_uniq_id;
-                let peer_info =
-                    match peer_info_for_walk.get(&ingress_id) {
-                        Some(pi) => pi,
-                        None => {
+                let mut sink = |msg: Vec<u8>, n: usize| {
+                    msg_tx.blocking_send((msg, n)).is_ok()
+                };
+                // FIX A: include any peer that actually has active routes,
+                // regardless of register state. If it wasn't enumerated, look
+                // it up in the register and, if it's a real peer type, emit
+                // its Peer Up now (so it precedes this peer's routes) and add
+                // it to the aggregator's peer map.
+                if !aggregator.has_peer(ingress_id) {
+                    match ingress_register_for_walk.get(ingress_id) {
+                        Some(info)
+                            if matches!(
+                                info.ingress_type,
+                                Some(IngressType::BgpViaBmp)
+                                    | Some(IngressType::Bgp)
+                                    | Some(IngressType::Mrt)
+                            ) =>
+                        {
+                            let pi = build_peer_info_for_emit(
+                                &info,
+                                &ingress_register_for_walk,
+                                forward_router_info,
+                                fan_in_peer_distinguisher,
+                            );
+                            let peer_up = bmp_builder::build_peer_up(&pi, false);
+                            if !sink(peer_up, 0) {
+                                client_gone = true;
+                                return false;
+                            }
+                            aggregator.insert_peer(ingress_id, pi.clone());
+                            discovered.push((ingress_id, pi));
+                        }
+                        _ => {
                             *skipped_unknown
                                 .entry(ingress_id)
                                 .or_insert(0) += 1;
                             continue;
                         }
-                    };
+                    }
+                }
                 let pamap = &route_record.meta;
                 *routes_per_ingress.entry(ingress_id).or_insert(0) += 1;
-                let mut sink = |msg: Vec<u8>, n: usize| {
-                    msg_tx.blocking_send((msg, n)).is_ok()
-                };
-                if !aggregator.add(
-                    ingress_id, peer_info, prefix, pamap, &mut sink,
-                ) {
+                if !aggregator.add(ingress_id, prefix, pamap, &mut sink) {
                     // Consumer dropped (client disconnected). Bail out
                     // of the iteration so the epoch guard is released.
                     client_gone = true;
@@ -270,7 +307,13 @@ pub async fn perform_initial_dump(
             let _ = aggregator.flush_all(&mut sink);
         }
         let agg_stats = aggregator.stats();
-        (routes_per_ingress, skipped_unknown, walk_result, agg_stats)
+        (
+            routes_per_ingress,
+            skipped_unknown,
+            walk_result,
+            agg_stats,
+            discovered,
+        )
     });
 
     const YIELD_EVERY: usize = 1024;
@@ -333,17 +376,22 @@ pub async fn perform_initial_dump(
 
     // Wait for the walker to finish so the epoch guard is released
     // before we proceed (and for the side-channel counters).
-    let (routes_per_ingress, skipped_unknown, walk_result, agg_stats) =
-        match walk_handle.await {
-            Ok(tuple) => tuple,
-            Err(join_err) => {
-                warn!(
-                    "bmp-out dump for {}: RIB walker task failed: {}",
-                    client.remote_addr, join_err
-                );
-                (HashMap::new(), HashMap::new(), Ok(0), (0, 0))
-            }
-        };
+    let (
+        routes_per_ingress,
+        skipped_unknown,
+        walk_result,
+        agg_stats,
+        discovered,
+    ) = match walk_handle.await {
+        Ok(tuple) => tuple,
+        Err(join_err) => {
+            warn!(
+                "bmp-out dump for {}: RIB walker task failed: {}",
+                client.remote_addr, join_err
+            );
+            (HashMap::new(), HashMap::new(), Ok(0), (0, 0), Vec::new())
+        }
+    };
     if let Err(e) = walk_result {
         warn!(
             "bmp-out dump for {}: stream_prefix_records error: {}",
@@ -439,13 +487,32 @@ pub async fn perform_initial_dump(
         }
     }
 
+    // FIX A: peers discovered mid-walk (active routes in the store but not
+    // enumerated from the register). Their Peer Up was already sent inline by
+    // the walk; here we register them as known peers and send their EoR
+    // markers, exactly like the enumerated peers above.
+    for (ingress_id, peer_info) in &discovered {
+        client.add_known_peer(*ingress_id).await;
+        for afisafi in [AfiSafiType::Ipv4Unicast, AfiSafiType::Ipv6Unicast] {
+            if let Some(msg) =
+                bmp_builder::build_end_of_rib_marker(peer_info, afisafi)
+            {
+                if !client.send_message(msg).await {
+                    return false;
+                }
+            }
+        }
+    }
+
     let dump_bytes =
         client.bytes_sent.load(Ordering::Relaxed) - bytes_before_dump;
     let dump_elapsed = dump_start.elapsed();
     info!(
-        "bmp-out dump for {}: dump complete, {} peers, {} total routes, {:.2} MB in {:.2}s",
+        "bmp-out dump for {}: dump complete, {} peers ({} discovered via walk \
+         fallback), {} total routes, {:.2} MB in {:.2}s",
         client.remote_addr,
-        peers.len(),
+        peers.len() + discovered.len(),
+        discovered.len(),
         total_routes,
         dump_bytes as f64 / (1024.0 * 1024.0),
         dump_elapsed.as_secs_f64(),
