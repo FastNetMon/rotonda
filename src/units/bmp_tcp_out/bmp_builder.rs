@@ -2,8 +2,11 @@
 ///
 /// Since routecore 0.6 has BMP parsing but no builder, we construct
 /// messages directly from bytes.
-use std::hash::Hasher;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use inetnum::addr::Prefix;
 use inetnum::asn::Asn;
@@ -51,6 +54,14 @@ const BGP_MARKER: [u8; 16] = [0xFF; 16];
 // BGP message types
 const BGP_MSG_OPEN: u8 = 1;
 const BGP_MSG_UPDATE: u8 = 2;
+
+/// Maximum size of a BGP UPDATE message (RFC 4271 §4: the BGP message length
+/// field caps a non-extended message at 4096 bytes). The aggregating dump
+/// builder packs as many same-attribute NLRI into one UPDATE as will fit
+/// under this, then starts a new message. We stay within the classic 4096
+/// limit (rather than the 2-byte field's 65535) so the synthetic feed is
+/// accepted by consumers that did not negotiate BGP extended messages.
+const MAX_BGP_UPDATE_LEN: usize = 4096;
 
 /// Information about a peer extracted from IngressInfo, used to construct
 /// BMP Per-Peer Headers and Peer Up messages.
@@ -514,6 +525,389 @@ pub fn build_route_monitoring_from_route(
     build_route_monitoring(peer, prefix, pamap, is_withdrawal)
 }
 
+fn hash_pa_blob(blob: &[u8]) -> u64 {
+    let mut h = DefaultHasher::new();
+    blob.hash(&mut h);
+    h.finish()
+}
+
+/// Build ONE BMP Route Monitoring message whose BGP UPDATE announces several
+/// prefixes that share a single identical path-attribute set (NLRI
+/// aggregation, RFC 4271 / RFC 4760).
+///
+/// All `prefixes` must belong to the same address family (`is_v4`) and the
+/// caller must guarantee the encoded BGP UPDATE fits [`MAX_BGP_UPDATE_LEN`]
+/// — [`RouteAggregator`] enforces both. `pa_bytes` are the path attributes
+/// already filtered of MP_REACH/MP_UNREACH (types 14/15); for IPv6,
+/// `next_hop` carries the next hop recovered from the original MP_REACH and a
+/// fresh MP_REACH_NLRI is rebuilt around all the prefixes.
+fn build_aggregated_route_monitoring(
+    peer: &PeerInfo,
+    prefixes: &[Prefix],
+    pa_bytes: &[u8],
+    next_hop: Option<&[u8]>,
+    is_v4: bool,
+) -> Vec<u8> {
+    let mut nlri = Vec::new();
+    for p in prefixes {
+        append_prefix_nlri(&mut nlri, *p);
+    }
+
+    let bgp_update = if is_v4 {
+        // IPv4: shared path attributes (incl. legacy NEXT_HOP, if any) once,
+        // then every prefix in the NLRI field.
+        let update_body_len = 2 + 2 + pa_bytes.len() + nlri.len();
+        let total_len = 19 + update_body_len;
+
+        let mut buf = Vec::with_capacity(total_len);
+        buf.extend_from_slice(&BGP_MARKER);
+        buf.extend_from_slice(&(total_len as u16).to_be_bytes());
+        buf.push(BGP_MSG_UPDATE);
+        buf.extend_from_slice(&0u16.to_be_bytes()); // Withdrawn Routes Length
+        buf.extend_from_slice(&(pa_bytes.len() as u16).to_be_bytes());
+        buf.extend_from_slice(pa_bytes);
+        buf.extend_from_slice(&nlri);
+        buf
+    } else {
+        // IPv6: shared attributes plus a single MP_REACH_NLRI (always encoded
+        // with the extended-length flag so the 2-byte length math is uniform
+        // regardless of how many prefixes are packed) carrying the shared
+        // next hop once and all prefixes as NLRI.
+        let default_nh = [0u8; 16];
+        let nh: &[u8] = next_hop.unwrap_or(&default_nh);
+
+        let value_len = 2 + 1 + 1 + nh.len() + 1 + nlri.len();
+        let mp_reach_len = 4 + value_len; // flags + type + 2-byte ext length
+        let total_pa_len = pa_bytes.len() + mp_reach_len;
+        let update_body_len = 2 + 2 + total_pa_len;
+        let total_len = 19 + update_body_len;
+
+        let mut buf = Vec::with_capacity(total_len);
+        buf.extend_from_slice(&BGP_MARKER);
+        buf.extend_from_slice(&(total_len as u16).to_be_bytes());
+        buf.push(BGP_MSG_UPDATE);
+        buf.extend_from_slice(&0u16.to_be_bytes()); // Withdrawn Routes Length
+        buf.extend_from_slice(&(total_pa_len as u16).to_be_bytes());
+        buf.extend_from_slice(pa_bytes);
+        // MP_REACH_NLRI (type 14), extended length.
+        buf.push(0x90);
+        buf.push(14);
+        buf.extend_from_slice(&(value_len as u16).to_be_bytes());
+        buf.extend_from_slice(&2u16.to_be_bytes()); // AFI = IPv6
+        buf.push(1); // SAFI = unicast
+        buf.push(nh.len() as u8);
+        buf.extend_from_slice(nh);
+        buf.push(0); // Reserved
+        buf.extend_from_slice(&nlri);
+        buf
+    };
+
+    let total_len =
+        BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + bgp_update.len();
+    let mut buf = Vec::with_capacity(total_len);
+    write_common_header(&mut buf, BMP_MSG_ROUTE_MONITORING, total_len as u32);
+    write_per_peer_header(&mut buf, peer);
+    buf.extend_from_slice(&bgp_update);
+    buf
+}
+
+/// In-memory cost charged to the accumulator budget per buffered prefix.
+/// `Prefix` plus its slot in the group's `Vec`; deliberately generous so the
+/// budget tracks real RSS rather than the (smaller) encoded NLRI length.
+const AGG_MEM_PER_PREFIX: usize = 32;
+
+/// In-memory cost charged per open group: the `AggGroup` struct, its hash-map
+/// slot, and small `Vec` headers. The attribute bytes are NOT counted — the
+/// group holds them via a shared `Arc<[u8]>` (no per-group allocation).
+const AGG_MEM_PER_GROUP: usize = 128;
+
+/// One open aggregation group: a (peer, address-family, attribute-set) under
+/// which prefixes accumulate until the group is flushed into a single
+/// multi-NLRI BGP UPDATE.
+///
+/// The group holds only a cheap `Arc<[u8]>` clone of the route's raw bytes
+/// (shared with the RIB record, so no copy) plus the accumulating prefix
+/// list. The filtered path attributes and next hop are recomputed from
+/// `raw` at emit time — paid once per emitted message, not held per open
+/// group — and the `PeerInfo` is looked up from the shared peer map at emit
+/// rather than cloned into every group.
+struct AggGroup {
+    /// Raw `RotondaPaMap` bytes (`[rpki, ppi, pa_blob...]`), shared with the
+    /// store record via `Arc`. Used both to detect hash collisions
+    /// (`raw[2..]`) and to recompute the filtered attributes at emit.
+    raw: Arc<[u8]>,
+    is_v4: bool,
+    prefixes: Vec<Prefix>,
+    /// Running encoded length of the NLRI accumulated so far.
+    nlri_total: usize,
+    /// Encoded BGP UPDATE length with zero prefixes (everything but NLRI).
+    base_len: usize,
+}
+
+impl AggGroup {
+    fn new(pamap: &RotondaPaMap, is_v4: bool) -> Self {
+        let (pa_bytes, next_hop_opt) = filter_raw_path_attributes(pamap);
+        let base_len = if is_v4 {
+            19 + 2 + 2 + pa_bytes.len()
+        } else {
+            let nh_len = next_hop_opt.as_ref().map(|n| n.len()).unwrap_or(16);
+            // + MP_REACH header (4) + AFI(2)+SAFI(1)+NHLEN(1)+NH+Reserved(1)
+            19 + 2 + 2 + pa_bytes.len() + 4 + (2 + 1 + 1 + nh_len + 1)
+        };
+        Self {
+            raw: pamap.raw_arc(),
+            is_v4,
+            prefixes: Vec::new(),
+            nlri_total: 0,
+            base_len,
+        }
+    }
+
+    /// The route's attribute blob (raw bytes after the rpki/ppi prefix),
+    /// used to confirm a hash-map key match before merging.
+    fn blob(&self) -> &[u8] {
+        self.raw.get(2..).unwrap_or(&[])
+    }
+
+    fn is_empty(&self) -> bool {
+        self.prefixes.is_empty()
+    }
+
+    fn bgp_update_len(&self) -> usize {
+        self.base_len + self.nlri_total
+    }
+
+    /// Real heap memory this group contributes to the accumulator budget.
+    fn cost(&self) -> usize {
+        AGG_MEM_PER_GROUP + self.prefixes.len() * AGG_MEM_PER_PREFIX
+    }
+
+    fn push(&mut self, prefix: Prefix, nlri_len: usize) {
+        self.prefixes.push(prefix);
+        self.nlri_total += nlri_len;
+    }
+
+    fn reset_prefixes(&mut self) {
+        self.prefixes.clear();
+        self.nlri_total = 0;
+    }
+
+    /// Encode the group's prefixes into one message (attributes recomputed
+    /// from `raw`) and hand it to `sink` paired with its prefix count. No-op
+    /// for an empty group. Returns `false` if the sink reports the consumer
+    /// is gone.
+    fn emit(
+        &self,
+        peer: &PeerInfo,
+        sink: &mut dyn FnMut(Vec<u8>, usize) -> bool,
+    ) -> bool {
+        if self.prefixes.is_empty() {
+            return true;
+        }
+        let (pa_bytes, next_hop) = filter_pa_from_raw(&self.raw);
+        let nh = if self.is_v4 {
+            None
+        } else {
+            next_hop.as_deref().or(Some(&[0u8; 16][..]))
+        };
+        let msg = build_aggregated_route_monitoring(
+            peer,
+            &self.prefixes,
+            &pa_bytes,
+            nh,
+            self.is_v4,
+        );
+        sink(msg, self.prefixes.len())
+    }
+}
+
+/// Accumulates dump-phase routes and emits them as aggregated multi-NLRI BGP
+/// UPDATEs: prefixes sharing one (peer, address-family, attribute-set) are
+/// packed into a single BMP Route Monitoring message instead of one message
+/// per prefix.
+///
+/// Because the RIB walk is prefix-major, a group's prefixes are scattered
+/// across the whole walk, so groups stay open until the end to aggregate
+/// fully. Memory is bounded by `max_bytes`: when exceeded, the fullest groups
+/// are flushed first (best aggregation, frees the most memory) until back
+/// under budget, leaving the long tail of small groups open to keep growing.
+/// This keeps aggregation effective at a given budget instead of repeatedly
+/// dumping half-empty groups (which a flush-everything policy would do).
+pub struct RouteAggregator {
+    groups: HashMap<(IngressId, bool, u64), AggGroup>,
+    peer_info: Arc<HashMap<IngressId, PeerInfo>>,
+    buffered_bytes: usize,
+    max_bytes: usize,
+    // Diagnostics, so the dump can report whether aggregation hit the budget
+    // (premature eviction) versus the table's natural attribute diversity.
+    groups_created: usize,
+    budget_evictions: usize,
+}
+
+impl RouteAggregator {
+    pub fn new(
+        max_bytes: usize,
+        peer_info: Arc<HashMap<IngressId, PeerInfo>>,
+    ) -> Self {
+        Self {
+            groups: HashMap::new(),
+            peer_info,
+            buffered_bytes: 0,
+            max_bytes,
+            groups_created: 0,
+            budget_evictions: 0,
+        }
+    }
+
+    /// `(groups_created, budget_evictions)` — number of distinct aggregation
+    /// groups opened, and number of groups force-flushed by the memory budget
+    /// before the final flush. A `budget_evictions` near zero means the
+    /// achieved routes/msg ratio reflects the table's real attribute sharing,
+    /// not a too-small budget.
+    pub fn stats(&self) -> (usize, usize) {
+        (self.groups_created, self.budget_evictions)
+    }
+
+    /// Add one stored route. Emits zero or more completed messages through
+    /// `sink` (each as `(bytes, prefix_count)`); returns `false` as soon as
+    /// the sink reports the consumer is gone, in which case the caller should
+    /// abort the walk.
+    pub fn add(
+        &mut self,
+        ingress_id: IngressId,
+        peer: &PeerInfo,
+        prefix: Prefix,
+        pamap: &RotondaPaMap,
+        sink: &mut dyn FnMut(Vec<u8>, usize) -> bool,
+    ) -> bool {
+        let is_v4 = prefix.is_v4();
+        let raw = pamap.as_ref();
+        let blob = raw.get(2..).unwrap_or(&[]);
+        let key = (ingress_id, is_v4, hash_pa_blob(blob));
+        let nlri_len = nlri_encoded_len(prefix);
+
+        // Pull the group out so the budget bookkeeping below borrows `self`
+        // freely.
+        let mut group = match self.groups.remove(&key) {
+            Some(g) if g.blob() == blob => {
+                self.buffered_bytes -= g.cost();
+                g
+            }
+            Some(other) => {
+                // Hash collision (distinct attributes sharing a hash): flush
+                // the displaced group and start fresh for these attributes.
+                self.buffered_bytes -= other.cost();
+                if !other.emit(peer, sink) {
+                    return false;
+                }
+                self.groups_created += 1;
+                AggGroup::new(pamap, is_v4)
+            }
+            None => {
+                self.groups_created += 1;
+                AggGroup::new(pamap, is_v4)
+            }
+        };
+
+        // If this prefix would push a non-empty group past the BGP UPDATE
+        // size limit, flush the group first (keeping its attribute set) and
+        // continue accumulating into the now-empty group.
+        if !group.is_empty()
+            && group.bgp_update_len() + nlri_len > MAX_BGP_UPDATE_LEN
+        {
+            if !group.emit(peer, sink) {
+                return false;
+            }
+            group.reset_prefixes();
+        }
+
+        // A single prefix whose attribute set alone overflows the limit can
+        // never be aggregated; emit it via the single-route builder (which
+        // also handles the truly-oversized drop case) and drop the group.
+        if group.is_empty()
+            && group.base_len + nlri_len > MAX_BGP_UPDATE_LEN
+        {
+            if let Some(msg) =
+                build_route_monitoring(peer, prefix, pamap, false)
+            {
+                if !sink(msg, 1) {
+                    return false;
+                }
+            }
+            // `group` was counted out above (or never counted); nothing to
+            // re-insert.
+            return true;
+        }
+
+        group.push(prefix, nlri_len);
+        self.buffered_bytes += group.cost();
+        self.groups.insert(key, group);
+
+        if self.buffered_bytes > self.max_bytes {
+            if !self.evict_until_under_budget(sink) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Flush the fullest open groups until the buffered total is back under
+    /// `max_bytes`. Fullest-first maximises routes/msg on each evicted
+    /// message and frees the most memory per flush, so the surviving small
+    /// groups keep accumulating.
+    fn evict_until_under_budget(
+        &mut self,
+        sink: &mut dyn FnMut(Vec<u8>, usize) -> bool,
+    ) -> bool {
+        // Order open groups by prefix count, descending.
+        let mut keys: Vec<(IngressId, bool, u64)> =
+            self.groups.keys().copied().collect();
+        keys.sort_unstable_by_key(|k| {
+            std::cmp::Reverse(
+                self.groups.get(k).map(|g| g.prefixes.len()).unwrap_or(0),
+            )
+        });
+
+        let peer_info = self.peer_info.clone();
+        // Evict down to half the budget so we don't re-trigger immediately on
+        // the next route.
+        let target = self.max_bytes / 2;
+        for k in keys {
+            if self.buffered_bytes <= target {
+                break;
+            }
+            if let Some(group) = self.groups.remove(&k) {
+                self.buffered_bytes -= group.cost();
+                self.budget_evictions += 1;
+                if let Some(peer) = peer_info.get(&k.0) {
+                    if !group.emit(peer, sink) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Emit every open group. Call once after the walk completes.
+    pub fn flush_all(
+        &mut self,
+        sink: &mut dyn FnMut(Vec<u8>, usize) -> bool,
+    ) -> bool {
+        let peer_info = self.peer_info.clone();
+        for (key, group) in self.groups.drain() {
+            if let Some(peer) = peer_info.get(&key.0) {
+                if !group.emit(peer, sink) {
+                    self.buffered_bytes = 0;
+                    return false;
+                }
+            }
+        }
+        self.buffered_bytes = 0;
+        true
+    }
+}
+
 /// Build a BMP Statistics Report (RFC 7854 §4.8) for the given peer.
 ///
 /// `body` is the opaque stats body received from upstream — the 4-byte
@@ -649,7 +1043,14 @@ fn bgp_update_too_long(prefix: Prefix, total_len: usize) -> Option<Vec<u8>> {
 fn filter_raw_path_attributes(
     pamap: &RotondaPaMap,
 ) -> (Vec<u8>, Option<Vec<u8>>) {
-    let raw = pamap.as_ref();
+    filter_pa_from_raw(pamap.as_ref())
+}
+
+/// As [`filter_raw_path_attributes`] but operating directly on the raw
+/// `RotondaPaMap` bytes (`[rpki, ppi, pa_blob...]`). Lets the dump aggregator
+/// recompute the filtered attributes from a held `Arc<[u8]>` at emit time
+/// instead of caching a second copy per open group.
+fn filter_pa_from_raw(raw: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
     if raw.len() < 2 {
         return (Vec::new(), None);
     }
@@ -747,12 +1148,12 @@ fn build_bgp_update_withdrawal(prefix: Prefix) -> Vec<u8> {
     }
 }
 
-/// Encode a prefix as BGP NLRI (prefix length byte + prefix bytes).
-fn encode_prefix_nlri(prefix: Prefix) -> Vec<u8> {
+/// Append a prefix encoded as BGP NLRI (prefix length byte + prefix bytes)
+/// to `buf`. Shared by the single- and multi-prefix encoders.
+fn append_prefix_nlri(buf: &mut Vec<u8>, prefix: Prefix) {
     let prefix_len = prefix.len();
     let num_bytes = ((prefix_len as usize) + 7) / 8;
 
-    let mut buf = Vec::with_capacity(1 + num_bytes);
     buf.push(prefix_len);
 
     match prefix.addr() {
@@ -763,8 +1164,20 @@ fn encode_prefix_nlri(prefix: Prefix) -> Vec<u8> {
             buf.extend_from_slice(&v6.octets()[..num_bytes]);
         }
     }
+}
 
+/// Encode a prefix as BGP NLRI (prefix length byte + prefix bytes).
+fn encode_prefix_nlri(prefix: Prefix) -> Vec<u8> {
+    let num_bytes = ((prefix.len() as usize) + 7) / 8;
+    let mut buf = Vec::with_capacity(1 + num_bytes);
+    append_prefix_nlri(&mut buf, prefix);
     buf
+}
+
+/// Wire length of a prefix encoded as BGP NLRI (length byte + significant
+/// prefix bytes), without allocating.
+fn nlri_encoded_len(prefix: Prefix) -> usize {
+    1 + ((prefix.len() as usize) + 7) / 8
 }
 
 fn build_eor_ipv4(peer: &PeerInfo) -> Vec<u8> {
@@ -1379,5 +1792,150 @@ mod tests {
         assert_eq!(peer.peer_distinguisher, real_rd);
         assert_eq!(pd_from_msg(&build_peer_up(&peer, false)), real_rd);
         assert_eq!(pd_from_msg(&build_peer_down(&peer)), real_rd);
+    }
+
+    fn agg_test_peer() -> PeerInfo {
+        PeerInfo {
+            peer_type: PeerType::GlobalInstance,
+            peer_flags: 0,
+            peer_distinguisher: [0u8; 8],
+            peer_address: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            peer_asn: Asn::from_u32(65000),
+            peer_bgp_id: [0u8; 4],
+            admin_label: None,
+        }
+    }
+
+    /// An aggregated IPv4 message packs every prefix's NLRI into one BGP
+    /// UPDATE behind a single shared attribute block, with self-consistent
+    /// length fields and within the BGP size limit.
+    #[test]
+    fn aggregated_v4_packs_multiple_nlri() {
+        let peer = agg_test_peer();
+        let pamap = RotondaPaMap::from(vec![0x40, 1, 1, 0]); // ORIGIN=IGP
+        let (pa_bytes, nh) = filter_raw_path_attributes(&pamap);
+        let prefixes = vec![
+            Prefix::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 0, 0)), 24)
+                .unwrap(),
+            Prefix::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 2, 0, 0)), 24)
+                .unwrap(),
+            Prefix::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 3, 0, 0)), 16)
+                .unwrap(),
+        ];
+        let msg = build_aggregated_route_monitoring(
+            &peer, &prefixes, &pa_bytes, nh.as_deref(), true,
+        );
+
+        assert_eq!(msg[0], BMP_VERSION);
+        assert_eq!(msg[5], BMP_MSG_ROUTE_MONITORING);
+        let bmp_len = u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
+        assert_eq!(bmp_len as usize, msg.len());
+
+        let bgp = &msg[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..];
+        let bgp_len = u16::from_be_bytes([bgp[16], bgp[17]]) as usize;
+        assert_eq!(bgp_len, bgp.len());
+        assert_eq!(bgp[18], BGP_MSG_UPDATE);
+        assert_eq!(u16::from_be_bytes([bgp[19], bgp[20]]), 0); // Withdrawn=0
+        let pa_len = u16::from_be_bytes([bgp[21], bgp[22]]) as usize;
+        assert_eq!(pa_len, pa_bytes.len());
+        // NLRI: (1+3) + (1+3) + (1+2) = 11 bytes for the three prefixes.
+        let nlri = &bgp[23 + pa_len..];
+        assert_eq!(nlri.len(), 11);
+        assert_eq!(nlri[0], 24);
+        assert!(bgp_len <= MAX_BGP_UPDATE_LEN);
+    }
+
+    /// The aggregator splits into a new message at the BGP UPDATE size limit,
+    /// never exceeds it, accounts for every route, and actually aggregates.
+    #[test]
+    fn aggregator_respects_update_size_limit() {
+        let peer = agg_test_peer();
+        let pamap = RotondaPaMap::from(vec![0x40, 1, 1, 0]);
+        let mut messages: Vec<(Vec<u8>, usize)> = Vec::new();
+        let mut peer_map: HashMap<IngressId, PeerInfo> = HashMap::new();
+        peer_map.insert(7, peer.clone());
+        let mut agg =
+            RouteAggregator::new(64 * 1024 * 1024, Arc::new(peer_map));
+        {
+            let mut sink = |m: Vec<u8>, n: usize| {
+                messages.push((m, n));
+                true
+            };
+            for i in 0..5000u32 {
+                let p = Prefix::new(
+                    IpAddr::V4(std::net::Ipv4Addr::new(
+                        100,
+                        (i >> 8) as u8,
+                        (i & 0xff) as u8,
+                        0,
+                    )),
+                    24,
+                )
+                .unwrap();
+                assert!(agg.add(7, &peer, p, &pamap, &mut sink));
+            }
+            assert!(agg.flush_all(&mut sink));
+        }
+
+        let mut total_routes = 0usize;
+        for (m, n) in &messages {
+            total_routes += n;
+            let bgp = &m[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..];
+            let bgp_len = u16::from_be_bytes([bgp[16], bgp[17]]) as usize;
+            assert_eq!(bgp_len, bgp.len());
+            assert!(bgp_len <= MAX_BGP_UPDATE_LEN);
+        }
+        assert_eq!(total_routes, 5000);
+        assert!(messages.len() < 100, "expected heavy aggregation");
+    }
+
+    /// Under a tiny budget the aggregator must evict (fullest-first) yet still
+    /// deliver every route exactly once, with each message within the size
+    /// limit — i.e. it degrades gracefully rather than losing or duplicating
+    /// routes.
+    #[test]
+    fn aggregator_tiny_budget_loses_no_routes() {
+        let peer = agg_test_peer();
+        // Two distinct attribute sets so multiple groups coexist.
+        let pamap_a = RotondaPaMap::from(vec![0x40, 1, 1, 0]); // ORIGIN IGP
+        let pamap_b = RotondaPaMap::from(vec![0x40, 1, 1, 2]); // ORIGIN INCOMPLETE
+        let mut peer_map: HashMap<IngressId, PeerInfo> = HashMap::new();
+        peer_map.insert(7, peer.clone());
+        // Budget of 1 KiB forces frequent eviction.
+        let mut agg = RouteAggregator::new(1024, Arc::new(peer_map));
+        let mut total = 0usize;
+        let mut evicted_within_limit = true;
+        {
+            let mut sink = |m: Vec<u8>, n: usize| {
+                total += n;
+                let bgp =
+                    &m[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..];
+                let bgp_len =
+                    u16::from_be_bytes([bgp[16], bgp[17]]) as usize;
+                if bgp_len != bgp.len() || bgp_len > MAX_BGP_UPDATE_LEN {
+                    evicted_within_limit = false;
+                }
+                true
+            };
+            for i in 0..2000u32 {
+                let p = Prefix::new(
+                    IpAddr::V4(std::net::Ipv4Addr::new(
+                        172,
+                        (i >> 8) as u8,
+                        (i & 0xff) as u8,
+                        0,
+                    )),
+                    24,
+                )
+                .unwrap();
+                let pamap = if i % 2 == 0 { &pamap_a } else { &pamap_b };
+                assert!(agg.add(7, &peer, p, pamap, &mut sink));
+            }
+            assert!(agg.flush_all(&mut sink));
+        }
+        assert_eq!(total, 2000);
+        assert!(evicted_within_limit);
+        // The budget was small enough that eviction actually fired.
+        assert!(agg.stats().1 > 0, "expected budget evictions to occur");
     }
 }

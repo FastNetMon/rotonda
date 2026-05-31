@@ -282,6 +282,14 @@ impl RotondaPaMap {
         let _ = parser.advance(2);
         routecore::bgp::path_attributes::PathAttributes::new(parser, ppi)
     }
+
+    /// Clone the shared raw-bytes `Arc` (rpki + ppi prefix followed by the
+    /// path-attribute blob). Cheap (refcount bump only) and shares storage
+    /// with the RIB record, so holding it — e.g. in the bmp-out dump
+    /// aggregator — adds no per-route heap allocation.
+    pub fn raw_arc(&self) -> Arc<[u8]> {
+        Arc::clone(&self.raw)
+    }
 }
 
 impl fmt::Display for RotondaPaMap {

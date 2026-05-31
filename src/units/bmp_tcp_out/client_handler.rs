@@ -25,6 +25,18 @@ use super::{
     unit::FanInPeerDistinguisher,
 };
 
+/// Memory budget for the dump-phase route aggregator. Because the RIB walk is
+/// prefix-major, a (peer, attribute-set) group's prefixes are scattered
+/// across the whole walk, so groups must stay open to aggregate fully; this
+/// bounds how much may be held before the fullest groups are evicted early.
+/// The aggregator now holds attribute bytes via shared `Arc`s and looks up
+/// peer info instead of cloning it, so the real per-group footprint is small
+/// — 256 MB comfortably holds a full-table walk's groups, letting aggregation
+/// reach the table's natural attribute-sharing ratio rather than being capped
+/// by premature eviction. Logged `budget evictions` near zero confirm the
+/// budget is not the limiting factor.
+const DUMP_AGGREGATOR_MAX_BYTES: usize = 256 * 1024 * 1024;
+
 /// Look up the parent (router-level) IngressInfo for a peer and build a
 /// JSON Admin Label string from its sysName/sysDescr.
 fn resolve_admin_label(
@@ -201,14 +213,24 @@ pub async fn perform_initial_dump(
     let rib_walk_start = Instant::now();
     let peer_info_arc: Arc<HashMap<IngressId, PeerInfo>> =
         Arc::new(peer_info_map);
+    // Channel item is (message bytes, number of routes packed in it): with
+    // NLRI aggregation one message may carry many prefixes, so the consumer
+    // needs the route count to keep its progress accounting accurate.
     let (msg_tx, mut msg_rx) =
-        tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+        tokio::sync::mpsc::channel::<(Vec<u8>, usize)>(1024);
     let rib_for_walk = rib.clone();
     let peer_info_for_walk = peer_info_arc.clone();
     let walk_handle = tokio::task::spawn_blocking(move || {
         let mut routes_per_ingress: HashMap<IngressId, usize> =
             HashMap::with_capacity(peer_info_for_walk.len());
         let mut skipped_unknown: HashMap<IngressId, usize> = HashMap::new();
+        let mut aggregator = bmp_builder::RouteAggregator::new(
+            DUMP_AGGREGATOR_MAX_BYTES,
+            peer_info_for_walk.clone(),
+        );
+        // Set if the consumer (client) goes away mid-walk, so we skip the
+        // post-walk flush instead of re-encoding messages for a dead socket.
+        let mut client_gone = false;
         let walk_result = rib_for_walk.stream_prefix_records(|pr| {
             let prefix = pr.prefix;
             for route_record in pr.meta {
@@ -224,42 +246,51 @@ pub async fn perform_initial_dump(
                         }
                     };
                 let pamap = &route_record.meta;
-                let Some(msg) = bmp_builder::build_route_monitoring(
-                    peer_info, prefix, pamap, false,
-                ) else {
-                    // Route can't be re-encoded within the 2-byte BGP length
-                    // field (oversized attribute blob); drop it rather than
-                    // emit a frame that corrupts the stream.
-                    continue;
+                *routes_per_ingress.entry(ingress_id).or_insert(0) += 1;
+                let mut sink = |msg: Vec<u8>, n: usize| {
+                    msg_tx.blocking_send((msg, n)).is_ok()
                 };
-                if msg_tx.blocking_send(msg).is_err() {
+                if !aggregator.add(
+                    ingress_id, peer_info, prefix, pamap, &mut sink,
+                ) {
                     // Consumer dropped (client disconnected). Bail out
                     // of the iteration so the epoch guard is released.
+                    client_gone = true;
                     return false;
                 }
-                *routes_per_ingress.entry(ingress_id).or_insert(0) += 1;
             }
             true
         });
-        (routes_per_ingress, skipped_unknown, walk_result)
+        // Flush whatever is still buffered into final aggregated messages,
+        // unless the client already disconnected.
+        if !client_gone {
+            let mut sink = |msg: Vec<u8>, n: usize| {
+                msg_tx.blocking_send((msg, n)).is_ok()
+            };
+            let _ = aggregator.flush_all(&mut sink);
+        }
+        let agg_stats = aggregator.stats();
+        (routes_per_ingress, skipped_unknown, walk_result, agg_stats)
     });
 
     const YIELD_EVERY: usize = 1024;
     const PROGRESS_LOG_EVERY: Duration = Duration::from_secs(5);
     let mut total_routes: usize = 0;
+    let mut total_messages: usize = 0;
     let mut since_yield: usize = 0;
     let mut last_progress_at = rib_walk_start;
     let mut last_progress_routes: usize = 0;
     let mut client_disconnected = false;
 
-    while let Some(msg) = msg_rx.recv().await {
+    while let Some((msg, route_count)) = msg_rx.recv().await {
         if !client.send_message(msg).await {
             // Writer task gone — drop the receiver so the blocking
             // walker's next blocking_send fails and it can exit.
             client_disconnected = true;
             break;
         }
-        total_routes += 1;
+        total_routes += route_count;
+        total_messages += 1;
 
         since_yield += 1;
         if since_yield >= YIELD_EVERY {
@@ -281,10 +312,12 @@ pub async fn perform_initial_dump(
                     .load(Ordering::Relaxed)
                     .saturating_sub(bytes_before_dump);
                 info!(
-                    "bmp-out dump for {}: progress {} routes ({:.0} r/s now, \
-                     {:.0} r/s avg), {} buffered ({:.1} MB), {:.1} MB sent",
+                    "bmp-out dump for {}: progress {} routes in {} msgs \
+                     ({:.0} r/s now, {:.0} r/s avg), {} buffered ({:.1} MB), \
+                     {:.1} MB sent",
                     client.remote_addr,
                     total_routes,
+                    total_messages,
                     instant_rate,
                     avg_rate,
                     buf_len,
@@ -300,15 +333,15 @@ pub async fn perform_initial_dump(
 
     // Wait for the walker to finish so the epoch guard is released
     // before we proceed (and for the side-channel counters).
-    let (routes_per_ingress, skipped_unknown, walk_result) =
+    let (routes_per_ingress, skipped_unknown, walk_result, agg_stats) =
         match walk_handle.await {
-            Ok(triple) => triple,
+            Ok(tuple) => tuple,
             Err(join_err) => {
                 warn!(
                     "bmp-out dump for {}: RIB walker task failed: {}",
                     client.remote_addr, join_err
                 );
-                (HashMap::new(), HashMap::new(), Ok(0))
+                (HashMap::new(), HashMap::new(), Ok(0), (0, 0))
             }
         };
     if let Err(e) = walk_result {
@@ -323,10 +356,22 @@ pub async fn perform_initial_dump(
     }
 
     let rib_walk_elapsed = rib_walk_start.elapsed();
+    let agg_ratio = if total_messages > 0 {
+        total_routes as f64 / total_messages as f64
+    } else {
+        0.0
+    };
+    let (agg_groups, agg_budget_evictions) = agg_stats;
     info!(
-        "bmp-out dump for {}: RIB walk sent {} routes in {:.2}s",
+        "bmp-out dump for {}: RIB walk sent {} routes in {} msgs \
+         ({:.1} routes/msg via NLRI aggregation; {} groups, {} budget \
+         evictions) in {:.2}s",
         client.remote_addr,
         total_routes,
+        total_messages,
+        agg_ratio,
+        agg_groups,
+        agg_budget_evictions,
         rib_walk_elapsed.as_secs_f64(),
     );
 
