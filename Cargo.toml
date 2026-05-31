@@ -100,6 +100,14 @@ rayon = "1.11.0"
 [target.'cfg(unix)'.dependencies]
 syslog             = "7.0"
 
+# jemalloc as the global allocator: glibc malloc retains freed pages under
+# fragmentation, so RSS plateaus at the high-water mark after a large bmp-out
+# dump instead of returning. jemalloc decays freed pages back to the OS and,
+# with the `profiling` feature, supports runtime heap profiling for leak
+# hunting (zero cost unless enabled via the `_RJEM_MALLOC_CONF` env var).
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator  = { version = "0.6", features = ["profiling", "background_threads_runtime_support"] }
+
 [dev-dependencies]
 hex                = "0.4"
 env_logger         = "0.11"

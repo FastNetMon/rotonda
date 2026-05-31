@@ -17,6 +17,16 @@ use tokio::{
     signal::{self, unix::signal, unix::SignalKind},
 };
 
+// Use jemalloc instead of the system allocator. glibc malloc keeps freed
+// memory on its free lists under the fragmented, small-allocation pattern the
+// RIB store produces, so RSS stays at the post-dump high-water mark. jemalloc
+// purges freed pages back to the OS via decay and (built with the `profiling`
+// feature) can dump heap profiles for leak hunting — both are runtime-tunable
+// through the `_RJEM_MALLOC_CONF` environment variable.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn run_with_cmdline_args() -> Result<(), Terminate> {
     Config::init()?;
 

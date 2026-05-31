@@ -96,3 +96,48 @@ NLnet Labs offers [professional support and consultancy
 services](https://www.nlnetlabs.nl/services/contracts/) with a service-level
 agreement. Rotonda is liberally licensed under the
 [Mozilla Public License 2.0](https://github.com/NLnetLabs/rotonda/blob/main/LICENSE).
+
+## Memory allocator (jemalloc) tuning
+
+This build uses jemalloc (`tikv-jemallocator`) as the global allocator instead
+of the system allocator, because glibc malloc retains freed pages on its free
+lists under the fragmented, small-allocation pattern the RIB store produces, so
+RSS plateaus at the high-water mark after a large bmp-out dump instead of
+falling back. jemalloc is tuned at runtime through the `_RJEM_MALLOC_CONF`
+environment variable (note the `_RJEM_` prefix — the plain `MALLOC_CONF`
+variable is silently ignored by this build).
+
+### Make RSS actually return after a dump
+
+```
+_RJEM_MALLOC_CONF="background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000"
+```
+
+- `background_thread:true` — a background thread purges decayed pages even when
+  an arena goes idle (critical: after a dump, if the feed quiets, idle arenas
+  still get reclaimed). This is enabled because the build includes the
+  `background_threads_runtime_support` feature.
+- decay 5s — freed pages go back to the OS (via `MADV_DONTNEED`, which does drop
+  RSS) within ~5s. Drop to `muzzy_decay_ms:0` for immediate return if you want
+  it aggressive.
+- Optional: `narenas:8` — jemalloc defaults to a high arena count (96 on a
+  typical box here); fewer arenas means less per-arena retained slack and a
+  lower baseline footprint, at a small concurrency cost. Worth trying.
+
+### Leak hunting (heap profiling)
+
+Profiling is compiled into this build, so it can be enabled at runtime:
+
+```
+_RJEM_MALLOC_CONF="prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:31,prof_prefix:/tmp/jeprof"
+```
+
+- Samples roughly every 512 KiB (low overhead) and auto-dumps a heap profile
+  every 2 GiB allocated to `/tmp/jeprof.*.heap`.
+- Analyze with:
+  ```
+  jeprof --show_bytes --text ./target/release/rotonda /tmp/jeprof.*.heap
+  ```
+  `jeprof` ships with `libjemalloc-dev`. The release profile is built with
+  `debug = 1`, so call sites are symbolized — the profile shows exactly which
+  call sites hold the bytes.
