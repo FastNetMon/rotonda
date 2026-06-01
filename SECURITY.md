@@ -2,8 +2,10 @@
 
 ## Supported Versions
 
-NLnet Labs adheres to the straightforward, semantic versioning scheme that is
-commonly used in the software industry.
+This repository is a FastNetMon Ltd maintained fork of NLnet Labs Rotonda.
+Security support for this fork is handled by FastNetMon Ltd, not NLnet Labs.
+
+FastNetMon Ltd uses semantic versioning for this fork.
 
 Support is provided in respect of the latest release, i.e. releases with the
 highest minor and patch version level. We do not backport security fixes to
@@ -16,16 +18,14 @@ In the event that, during this period, a new patch or minor version of the
 previous major version is released, then support on these versions will only be
 provided for the remainder of the one-year-period.
 
-You can find detailed information on our software support policy here:
-
-https://www.nlnetlabs.nl/support/software-support-policy/
-
 ## Reporting a Vulnerability
 
 We take security very seriously. If you have discovered a security vulnerability
-in one of our projects and you would like to report it to us, you can send an
-encrypted message to our Security Entry Point.
+in this fork, report it through FastNetMon Ltd support:
 
-Details are described here:
+https://fastnetmon.com/contact/
 
-https://www.nlnetlabs.nl/security-report/
+support@fastnetmon.com
+
+If the issue affects upstream NLnet Labs Rotonda as well, please say so in the
+report so it can be coordinated appropriately.

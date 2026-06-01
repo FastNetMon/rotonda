@@ -2,8 +2,12 @@
 
 <img align="right" src="doc/manual/source/resources/rotonda-illustrative-icon.png" height="150">
 
-
 The composable, programmable BGP Engine
+
+This repository is a FastNetMon Ltd maintained fork of NLnet Labs Rotonda. It
+is not an official NLnet Labs release. The original upstream project is
+available at <https://github.com/NLnetLabs/rotonda/>. See [NOTICE.md](NOTICE.md)
+for fork attribution and licensing notes.
 
 The current version of Rotonda allows you to open BGP and BMP sessions and
 collect incoming routes from many peers into a in-memory database, modeled as
@@ -16,21 +20,18 @@ API.
 Future versions of Rotonda will support an on-disk database, using external
 datasets in filters, reading routes from Kafka streams, and more.
 
-Read the [documentation](https://rotonda.docs.nlnetlabs.nl) to find out how to
-install and use Rotonda.
+Read the fork documentation and release notes in this repository to install and
+use this FastNetMon-maintained build of Rotonda.
 
 > `Rotonda` is under active development and features are added regularly.
 > The APIs, the configuration and the `Roto` syntax may change between
 > 0.x versions.
 >
-> For more information on upcoming features and changes see the 
-> [roadmap](https://community.nlnetlabs.nl/t/rotonda-roadmap-for-2026/34/5).
+> For more information on upstream NLnet Labs Rotonda, see
+> <https://github.com/NLnetLabs/rotonda/>.
 
-Go to the [community forum](https://community.nlnetlabs.nl/c/rotonda/5) to
-get support from the community, exchange experiences, open issues, and more.
-
-Rather than opening issues on GitHub we encourage you to open topics on our
-forum.
+For issues with this fork, use the FastNetMon repository and support channels.
+Upstream NLnet Labs community resources may not apply to this fork.
 
 ## GOALS
 
@@ -90,12 +91,11 @@ forum.
    connections with tools like Routinator and Krill. Besides that, Rotonda
    supports BGPsec out of the box. Again, no patching or recompiling required.
 
-#### Open-source with professional support services
+#### Open Source License
 
-NLnet Labs offers [professional support and consultancy
-services](https://www.nlnetlabs.nl/services/contracts/) with a service-level
-agreement. Rotonda is liberally licensed under the
-[Mozilla Public License 2.0](https://github.com/NLnetLabs/rotonda/blob/main/LICENSE).
+Rotonda is licensed under the [Mozilla Public License 2.0](LICENSE). This fork
+preserves upstream NLnet Labs attribution and adds FastNetMon Ltd attribution
+for fork-specific modifications.
 
 ## Memory allocator (jemalloc) tuning
 
