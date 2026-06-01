@@ -22,7 +22,7 @@ path = "doc/bin/print_rotonda_std_doc.rs"
 version = "0.6.0-fnm9"
 edition = "2021"
 rust-version = "1.87"
-authors = ["FastNetMon Ltd <support@fastnetmon.com>"]
+authors = ["NLnet Labs <routing-team@nlnetlabs.nl>", "FastNetMon Ltd <support@fastnetmon.com>"]
 
 
 [workspace]
