@@ -1470,6 +1470,19 @@ impl PeerAware for PeerStates {
         bmp_ingress_id: ingress::IngressId,
         mut tlv_iter: InformationTlvIter,
     ) -> (bool, Option<IngressId>) {
+        // Duplicate PeerUp for a peer that is already up (no intervening
+        // PeerDown - common exporter misbehavior). Short-circuit BEFORE
+        // touching the register: otherwise find_existing_peer_and_claim may
+        // miss the live entry and mint a fresh ingress_id, update_info marks it
+        // Connected, but the entry(pph).or_insert_with below won't store it
+        // (the PPH key already exists) - orphaning a Connected mui that GC
+        // (which only reaps Disconnected) can never reclaim. The caller treats
+        // `added == false` as the already-up duplicate and rejects the message;
+        // the Option is only read on the `added == true` path, so None is fine.
+        if self.0.contains_key(&pph) {
+            return (false, None);
+        }
+
         let mut added = false;
 
         let mut query_ingress = ingress::IngressInfo::new()
