@@ -4,7 +4,11 @@ use std::{
     hash::{BuildHasher, Hasher},
     net::IpAddr,
     ops::Deref,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    time::Instant,
 };
 
 use chrono::{Duration, Utc};
@@ -43,6 +47,94 @@ use crate::{
 use super::{http_ng::Include, QueryFilter};
 
 type Store = StarCastRib<RotondaPaMap, MemoryOnlyConfig>;
+
+// ---------------------------------------------------------------------------
+// Streaming full-RIB dump tuning + concurrency control
+// ---------------------------------------------------------------------------
+
+/// Number of prefix *keys* whose records are fetched into one owned batch
+/// before that batch is emitted to the consumer.
+///
+/// A full-RIB dump enumerates keys up front (guard-free) and then, per chunk
+/// of this many keys, materialises the chunk's records under short-lived
+/// per-prefix guards and emits them with NO epoch guard held. This bounds the
+/// transient memory of a dump's in-flight batch to roughly
+/// `DUMP_KEY_CHUNK * records_per_prefix * record_size` (kilobytes-to-low-MB),
+/// independent of total table size or path count.
+const DUMP_KEY_CHUNK: usize = 512;
+
+/// Wall-clock backstop for a single full-RIB dump.
+///
+/// The streaming design already prevents a slow dump from leaking memory (no
+/// epoch guard is ever held across the network-paced emission), so this only
+/// guards against a pathologically long-running dump indefinitely occupying a
+/// blocking thread, a dump slot and a key buffer. It is deliberately set well
+/// above any legitimate full-table dump time — 300M records at even 50k
+/// records/s is ~100 min — so it never truncates a real dump; on reaching it
+/// the walk stops and logs, returning the partial count.
+const DUMP_MAX_DURATION: std::time::Duration =
+    std::time::Duration::from_secs(3 * 60 * 60);
+
+/// Maximum number of concurrent full-RIB dumps across ALL output paths
+/// (bmp-out table dumps + HTTP `?format=jsonl` dumps combined).
+///
+/// Each in-flight dump holds a blocking thread and an owned key buffer
+/// (~table-size × `Prefix`); this caps the aggregate so a burst of dump
+/// requests — notably on the unauthenticated HTTP endpoint — cannot pile up
+/// unboundedly. See [`DumpGuard`].
+const MAX_CONCURRENT_DUMPS: usize = 8;
+
+static ACTIVE_DUMPS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII counter for in-flight full-RIB dumps, enforcing [`MAX_CONCURRENT_DUMPS`].
+///
+/// Trusted callers that must not be rejected (a connecting BMP collector)
+/// use [`DumpGuard::enter`], which always succeeds but still counts toward the
+/// global total so untrusted callers back off. Untrusted callers (the HTTP
+/// endpoint) use [`DumpGuard::try_enter`], which returns `None` once the cap
+/// is reached so the request can be refused with `503` instead of adding load.
+#[must_use = "the dump slot is released when the DumpGuard is dropped"]
+pub struct DumpGuard(());
+
+impl DumpGuard {
+    /// Enter a dump unconditionally (for trusted callers). Always succeeds;
+    /// still increments the shared in-flight count.
+    pub fn enter() -> DumpGuard {
+        ACTIVE_DUMPS.fetch_add(1, Ordering::AcqRel);
+        DumpGuard(())
+    }
+
+    /// Try to enter a dump subject to the global cap (for untrusted callers).
+    /// Returns `None` when [`MAX_CONCURRENT_DUMPS`] is already in flight.
+    pub fn try_enter() -> Option<DumpGuard> {
+        let mut cur = ACTIVE_DUMPS.load(Ordering::Relaxed);
+        loop {
+            if cur >= MAX_CONCURRENT_DUMPS {
+                return None;
+            }
+            match ACTIVE_DUMPS.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(DumpGuard(())),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// Current number of in-flight dumps (diagnostics only).
+    pub fn active() -> usize {
+        ACTIVE_DUMPS.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for DumpGuard {
+    fn drop(&mut self) {
+        ACTIVE_DUMPS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 type RotoHttpFilter = roto::TypedFunc<
     Ctx,
@@ -1080,13 +1172,38 @@ impl Rib {
     ///
     /// Withdrawn meta entries are filtered out before the closure is
     /// called, and prefixes whose entire meta vec is withdrawn are
-    /// skipped — matching `iter_all_prefix_records` semantics.
+    /// skipped — matching `iter_all_prefix_records` semantics. A record is
+    /// emitted iff it is `Active` or `InActive` and its mui is not globally
+    /// withdrawn (identical to the previous
+    /// `prefixes_iter` + `retain(!Withdrawn)` filtering).
     ///
-    /// The crossbeam_epoch guard is held for the entire iteration, so
-    /// any garbage produced by concurrent RIB updates cannot be
-    /// reclaimed until the closure returns. Keep iterations bounded
-    /// (the closure can return `false` once a deadline is hit) or
-    /// expect peak RSS to track update churn × wall-clock walk time.
+    /// ## Memory model — no epoch guard is held across `f`
+    ///
+    /// A naive `prefixes_iter(&guard)` walk borrows a single `epoch::pin()`
+    /// guard for its entire lifetime and reads every record value inline, so
+    /// when `f` blocks on a slow consumer the guard stays pinned and
+    /// concurrent BGP/BMP churn garbage cannot be reclaimed — peak RSS then
+    /// tracks `churn_rate × walk_wall_time` (unbounded for a trickling
+    /// client). To avoid that, this method:
+    ///
+    /// 1. enumerates just the prefix *keys* up front via the guard-free
+    ///    `prefixes_keys_iter` (bounded by table size, not path count); then
+    /// 2. for each [`DUMP_KEY_CHUNK`]-sized chunk of keys, fetches that
+    ///    chunk's records into an owned batch — each `get_records_for_prefix`
+    ///    pins its OWN short-lived guard — and emits the batch to `f` with
+    ///    **no** guard held at all.
+    ///
+    /// Because no guard is ever live across a (potentially blocking) call into
+    /// `f`, a slow or stalled consumer can no longer pin churn garbage.
+    ///
+    /// As the walk is no longer a point-in-time snapshot, a prefix withdrawn
+    /// between key enumeration and record fetch is simply skipped, and updates
+    /// landing mid-walk may or may not appear — acceptable for a dump, and no
+    /// weaker than the previous "essentially unordered" iterator under
+    /// concurrent mutation.
+    ///
+    /// A [`DUMP_MAX_DURATION`] wall-clock backstop stops a pathologically long
+    /// dump early (logged; partial count returned).
     pub fn stream_prefix_records<F>(
         &self,
         mut f: F,
@@ -1094,23 +1211,59 @@ impl Rib {
     where
         F: FnMut(PrefixRecord<RotondaPaMap>) -> bool,
     {
-        let guard = &epoch::pin();
         let store = (*self.unicast)
             .as_ref()
             .ok_or(PrefixStoreError::StoreNotReadyError.to_string())?;
 
+        // Phase A: enumerate keys only (no epoch guard, no record reads).
+        let keys: Vec<Prefix> = store.prefixes_keys_iter().collect();
+
+        // Phase B: fetch + emit in bounded chunks, never holding a guard
+        // across `f`.
+        let deadline = Instant::now() + DUMP_MAX_DURATION;
         let mut count = 0usize;
-        for mut pr in store.prefixes_iter(guard).flatten() {
-            pr.meta.retain(|r| r.status != RouteStatus::Withdrawn);
-            if pr.meta.is_empty() {
-                continue;
+        let mut deadline_hit = false;
+        'outer: for chunk in keys.chunks(DUMP_KEY_CHUNK) {
+            let mut batch: Vec<PrefixRecord<RotondaPaMap>> =
+                Vec::with_capacity(chunk.len());
+            for &prefix in chunk {
+                // include_withdrawn=true mirrors the legacy get_value(true);
+                // the retain below then drops Withdrawn (incl. globally
+                // withdrawn muis), keeping Active + InActive exactly as before.
+                if let Ok(Some(mut meta)) =
+                    store.get_records_for_prefix(&prefix, None, true)
+                {
+                    meta.retain(|r| r.status != RouteStatus::Withdrawn);
+                    if !meta.is_empty() {
+                        batch.push(PrefixRecord::new(prefix, meta));
+                    }
+                }
+                // Ok(None)/Err: prefix withdrawn or unreadable since Phase A —
+                // skip (best-effort dump snapshot).
             }
-            count += 1;
-            if !f(pr) {
+
+            // Emit with NO guard held: f may block on slow network I/O.
+            for pr in batch {
+                count += 1;
+                if !f(pr) {
+                    break 'outer;
+                }
+            }
+
+            if Instant::now() >= deadline {
+                deadline_hit = true;
                 break;
             }
         }
-        debug!("rib::stream_prefix_records: {} prefix records", count);
+
+        if deadline_hit {
+            warn!(
+                "rib::stream_prefix_records: dump deadline ({}s) reached \
+                 after {count} records; emitting partial RIB",
+                DUMP_MAX_DURATION.as_secs()
+            );
+        }
+        debug!("rib::stream_prefix_records: {count} prefix records");
         Ok(count)
     }
 
@@ -1560,8 +1713,6 @@ impl Rib {
         prefixes_emitted: &mut u64,
         records_emitted: &mut u64,
     ) -> Result<(), crate::representation::OutputError> {
-        let guard = &epoch::pin();
-
         let store = match afisafi {
             AfiSafiType::Ipv4Unicast | AfiSafiType::Ipv6Unicast => {
                 (*self.unicast).as_ref().ok_or_else(|| {
@@ -1611,74 +1762,115 @@ impl Rib {
                 None => None,
             };
 
-        // Determine if we iterate over IPv4 or IPv6
+        // Determine if we iterate over IPv4 or IPv6, then enumerate that
+        // family's prefix *keys* only (guard-free) — so no epoch guard is held
+        // across the network-paced serialization below. The HTTP jsonl client
+        // may drain at a trickle (or stall), and the previous
+        // `prefixes_iter_v4/_v6(&guard)` walk pinned one guard for the whole
+        // emission, making concurrent churn garbage unreclaimable. See
+        // `stream_prefix_records` for the full rationale.
         let is_v4 = query_prefix.is_v4();
-        let iter: Box<dyn Iterator<Item = PrefixRecord<RotondaPaMap>> + '_> =
-            if is_v4 {
-                Box::new(store.prefixes_iter_v4(guard).flatten())
-            } else {
-                Box::new(store.prefixes_iter_v6(guard).flatten())
-            };
+        let keys: Vec<Prefix> = if is_v4 {
+            store.prefixes_keys_iter_v4().collect()
+        } else {
+            store.prefixes_keys_iter_v6().collect()
+        };
 
-        for mut pr in iter {
-            *prefixes_scanned += 1;
+        let deadline = Instant::now() + DUMP_MAX_DURATION;
 
-            // 1. Filter out withdrawn records
-            pr.meta.retain(|r| r.status != RouteStatus::Withdrawn);
-            if pr.meta.is_empty() {
-                continue;
-            }
-
-            // 2. Apply standard filters in place
-            self.apply_filter(
-                &mut pr.meta,
-                &filter,
-                maybe_roto_function.clone(),
-                &ingress_info,
-            );
-            if pr.meta.is_empty() {
-                continue;
-            }
-
-            *prefixes_emitted += 1;
-
-            // Determine if the prefix is the query prefix itself
-            let section = if pr.prefix == query_prefix {
-                "data"
-            } else {
-                "moreSpecifics"
-            };
-
-            for record in &pr.meta {
-                *records_emitted += 1;
-                let ingress = ingress_info
-                    .get(&record.multi_uniq_id)
-                    .map(|info| (record.multi_uniq_id, info).into());
-                let status = RouteStatusWrapper(record.status);
-
-                if filter.fields_path_attributes.is_some() {
-                    let line = JsonlLineFiltered {
-                        prefix: pr.prefix,
-                        section,
-                        status,
-                        ingress,
-                        pamap: RotondaPaMapWithQueryFilter(
-                            &record.meta,
-                            &filter,
-                        ),
-                    };
-                    serde_json::to_writer(&mut *target, &line)?;
-                } else {
-                    let line = JsonlLine {
-                        prefix: pr.prefix,
-                        section,
-                        status,
-                        ingress,
-                        pamap: &record.meta,
-                    };
-                    serde_json::to_writer(&mut *target, &line)?;
+        for chunk in keys.chunks(DUMP_KEY_CHUNK) {
+            // Materialise this chunk's records under short-lived per-prefix
+            // guards (get_records_for_prefix pins its own guard). Fetch with
+            // include_withdrawn=true to match the legacy get_value(true) input;
+            // the emit loop applies the same retain(!Withdrawn) as before.
+            let mut batch: Vec<PrefixRecord<RotondaPaMap>> =
+                Vec::with_capacity(chunk.len());
+            for &prefix in chunk {
+                match store.get_records_for_prefix(&prefix, None, true) {
+                    Ok(Some(meta)) => {
+                        batch.push(PrefixRecord::new(prefix, meta))
+                    }
+                    // Empty-default to preserve the legacy scanned-count for a
+                    // prefix that has no live records.
+                    Ok(None) => {
+                        batch.push(PrefixRecord::new(prefix, Vec::new()))
+                    }
+                    Err(_) => {}
                 }
-                target.write_all(b"\n")?;
+            }
+
+            // Emit the batch with NO epoch guard held: serde_json::to_writer
+            // and target.write_all may block on a slow HTTP client.
+            for mut pr in batch {
+                *prefixes_scanned += 1;
+
+                // 1. Filter out withdrawn records
+                pr.meta.retain(|r| r.status != RouteStatus::Withdrawn);
+                if pr.meta.is_empty() {
+                    continue;
+                }
+
+                // 2. Apply standard filters in place
+                self.apply_filter(
+                    &mut pr.meta,
+                    &filter,
+                    maybe_roto_function.clone(),
+                    &ingress_info,
+                );
+                if pr.meta.is_empty() {
+                    continue;
+                }
+
+                *prefixes_emitted += 1;
+
+                // Determine if the prefix is the query prefix itself
+                let section = if pr.prefix == query_prefix {
+                    "data"
+                } else {
+                    "moreSpecifics"
+                };
+
+                for record in &pr.meta {
+                    *records_emitted += 1;
+                    let ingress = ingress_info
+                        .get(&record.multi_uniq_id)
+                        .map(|info| (record.multi_uniq_id, info).into());
+                    let status = RouteStatusWrapper(record.status);
+
+                    if filter.fields_path_attributes.is_some() {
+                        let line = JsonlLineFiltered {
+                            prefix: pr.prefix,
+                            section,
+                            status,
+                            ingress,
+                            pamap: RotondaPaMapWithQueryFilter(
+                                &record.meta,
+                                &filter,
+                            ),
+                        };
+                        serde_json::to_writer(&mut *target, &line)?;
+                    } else {
+                        let line = JsonlLine {
+                            prefix: pr.prefix,
+                            section,
+                            status,
+                            ingress,
+                            pamap: &record.meta,
+                        };
+                        serde_json::to_writer(&mut *target, &line)?;
+                    }
+                    target.write_all(b"\n")?;
+                }
+            }
+
+            if Instant::now() >= deadline {
+                warn!(
+                    "rib dump: deadline ({}s) reached after {} prefixes; \
+                     emitting partial RIB",
+                    DUMP_MAX_DURATION.as_secs(),
+                    *prefixes_emitted
+                );
+                break;
             }
         }
 

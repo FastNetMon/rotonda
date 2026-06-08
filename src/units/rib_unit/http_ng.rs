@@ -156,16 +156,29 @@ pub enum Include {
 
 const STREAM_CHUNK_SIZE: usize = 256 * 1024;
 
+/// How long a streaming response may block on a single channel send — i.e. a
+/// client that has stopped reading, leaving the bounded response channel full
+/// — before the dump is aborted. Without this bound a connected-but-stalled
+/// client pins the blocking dump thread (and, for full-table dumps, its
+/// [`super::rib::DumpGuard`] slot) indefinitely.
+const STREAM_WRITE_STALL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
 struct StreamResponseWriter {
     sender: mpsc::Sender<Result<Bytes, io::Error>>,
     buffer: Vec<u8>,
+    handle: tokio::runtime::Handle,
 }
 
 impl StreamResponseWriter {
-    fn new(sender: mpsc::Sender<Result<Bytes, io::Error>>) -> Self {
+    fn new(
+        sender: mpsc::Sender<Result<Bytes, io::Error>>,
+        handle: tokio::runtime::Handle,
+    ) -> Self {
         Self {
             sender,
             buffer: Vec::with_capacity(STREAM_CHUNK_SIZE),
+            handle,
         }
     }
 
@@ -175,9 +188,24 @@ impl StreamResponseWriter {
         }
         let chunk = Bytes::copy_from_slice(&self.buffer);
         self.buffer.clear();
-        self.sender.blocking_send(Ok(chunk)).map_err(|_| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "receiver dropped")
-        })
+        // Bounded send (runs on a spawn_blocking thread, so block_on is legal):
+        // abort the dump if the client stops draining for STREAM_WRITE_STALL
+        // (channel stays full). A closed channel — client disconnected — still
+        // maps to BrokenPipe exactly as the previous blocking_send did.
+        self.handle
+            .block_on(
+                self.sender.send_timeout(Ok(chunk), STREAM_WRITE_STALL),
+            )
+            .map_err(|e| match e {
+                mpsc::error::SendTimeoutError::Timeout(_) => io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "client stalled draining response",
+                ),
+                mpsc::error::SendTimeoutError::Closed(_) => io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "receiver dropped",
+                ),
+            })
     }
 }
 
@@ -202,9 +230,10 @@ fn stream_search_result(
     let stream = ReceiverStream::new(rx);
 
     let format = search_result.query_filter().format;
+    let handle = tokio::runtime::Handle::current();
 
     tokio::task::spawn_blocking(move || {
-        let mut writer = StreamResponseWriter::new(tx);
+        let mut writer = StreamResponseWriter::new(tx, handle);
         match format {
             OutputFormat::Json => {
                 let _ = search_result.write(&mut Json(&mut writer));
@@ -232,11 +261,30 @@ fn stream_all_routes(
     rib.check_filter_and_store(afisafi, &filter)
         .map_err(ApiError::BadRequest)?;
 
+    // This endpoint is unauthenticated and a full-table jsonl dump is heavy
+    // (one blocking thread + a table-sized key buffer). Cap the number of
+    // concurrent dumps across all output paths; refuse with 503 rather than
+    // piling on another when the cap is reached. The permit is released when
+    // the spawn_blocking closure below ends.
+    let permit = super::rib::DumpGuard::try_enter().ok_or_else(|| {
+        warn!(
+            "rib dump refused: {} concurrent dumps already in flight \
+             (cap reached)",
+            super::rib::DumpGuard::active()
+        );
+        ApiError::ServiceUnavailable(
+            "too many concurrent RIB dumps in progress; retry shortly"
+                .to_string(),
+        )
+    })?;
+
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(64);
     let stream = ReceiverStream::new(rx);
+    let handle = tokio::runtime::Handle::current();
 
     tokio::task::spawn_blocking(move || {
-        let mut writer = StreamResponseWriter::new(tx);
+        let _permit = permit;
+        let mut writer = StreamResponseWriter::new(tx, handle);
         let _ = rib.write_jsonl_stream(
             afisafi,
             query_prefix,

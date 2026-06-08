@@ -13,7 +13,7 @@ use crate::{
         IngressInfo, IngressType,
     },
     payload::{Payload, RotondaRoute, Update},
-    units::rib_unit::rib::Rib,
+    units::rib_unit::rib::{DumpGuard, Rib},
 };
 use routecore::bgp::types::AfiSafiType;
 
@@ -104,6 +104,13 @@ pub async fn perform_initial_dump(
 ) -> bool {
     status_reporter.dump_started(client.remote_addr);
 
+    // Occupy a global dump slot for the lifetime of this dump (released when
+    // `_dump_permit` drops at function return). BMP collectors are trusted and
+    // must be served, so we `enter()` unconditionally; the slot still counts
+    // toward the global cap so the unauthenticated HTTP `?format=jsonl` dump
+    // endpoint backs off (503) when many table dumps are already in flight.
+    let _dump_permit = DumpGuard::enter();
+
     // 1. Send Initiation Message
     let init_msg = bmp_builder::build_initiation_message(sys_name, sys_descr);
     if !client.send_message(init_msg).await {
@@ -189,12 +196,20 @@ pub async fn perform_initial_dump(
 
     // 4. Phase 2: Single RIB walk — send all routes for all peers interleaved
     //
-    // Streaming model: a blocking thread holds the crossbeam_epoch guard and
-    // builds BMP RouteMonitoring messages, pushing them into a bounded
-    // mpsc channel. The async side `recv`s from the channel and forwards
-    // each message to the client's writer task. Backpressure is natural —
-    // a full channel blocks the producer until the consumer drains a slot,
-    // which ties the RIB-walk rate to the client's TCP throughput.
+    // Streaming model: a blocking thread walks the RIB (via
+    // `stream_prefix_records`) and builds BMP RouteMonitoring messages,
+    // pushing them into a bounded mpsc channel. The async side `recv`s from
+    // the channel and forwards each message to the client's writer task.
+    // Backpressure is natural — a full channel blocks the producer until the
+    // consumer drains a slot, which ties the RIB-walk rate to the client's
+    // TCP throughput.
+    //
+    // Crucially, `stream_prefix_records` holds NO crossbeam_epoch guard while
+    // our closure blocks on that bounded channel: it enumerates prefix keys
+    // up front and then fetches each chunk's records under short-lived guards,
+    // invoking the closure with no guard live. So a slow/stalled collector can
+    // no longer pin concurrent BGP/BMP churn garbage for the whole walk — peak
+    // RSS no longer tracks `churn_rate × walk_wall_time`.
     //
     // Why not just collect into a `Vec` first (the previous behavior):
     // at 100M+ routes the `Vec<PrefixRecord>` alone is many GB, and that
@@ -290,8 +305,8 @@ pub async fn perform_initial_dump(
                 let pamap = &route_record.meta;
                 *routes_per_ingress.entry(ingress_id).or_insert(0) += 1;
                 if !aggregator.add(ingress_id, prefix, pamap, &mut sink) {
-                    // Consumer dropped (client disconnected). Bail out
-                    // of the iteration so the epoch guard is released.
+                    // Consumer dropped (client disconnected). Bail out of the
+                    // iteration so the walk stops promptly.
                     client_gone = true;
                     return false;
                 }
@@ -397,8 +412,8 @@ pub async fn perform_initial_dump(
         client.discard_dump_buffer().await;
     }
 
-    // Wait for the walker to finish so the epoch guard is released
-    // before we proceed (and for the side-channel counters).
+    // Wait for the walker to finish before we proceed (it carries the
+    // side-channel counters back via its JoinHandle).
     let (
         routes_per_ingress,
         skipped_unknown,

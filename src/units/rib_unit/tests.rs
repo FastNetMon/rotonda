@@ -1056,6 +1056,88 @@ async fn test_check_filter_and_store_and_ingress_id_filtering() {
     assert!(ids_v6.contains(&10));
 }
 
+/// `stream_prefix_records` (the bmp-out table-dump path) must emit exactly the
+/// active records across BOTH address families and skip withdrawn ones — the
+/// same set the old `prefixes_iter(&guard) + retain(!Withdrawn)` walk produced.
+/// This locks in behavioural equivalence after the guard-free two-phase
+/// rewrite (enumerate keys, then fetch+emit each chunk under short-lived
+/// per-prefix guards with no guard held across the closure).
+#[tokio::test]
+async fn stream_prefix_records_emits_active_skips_withdrawn() {
+    let (runner, _) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+
+    rib.ingress_register
+        .update_info(10, crate::ingress::IngressInfo::default());
+    rib.ingress_register
+        .update_info(20, crate::ingress::IngressInfo::default());
+
+    let pfx_v4_a = Prefix::from_str("192.0.2.0/24").unwrap();
+    let pfx_v4_b = Prefix::from_str("198.51.100.0/24").unwrap();
+    let pfx_v6 = Prefix::from_str("2001:db8::/32").unwrap();
+
+    runner
+        .process_update(mk_route_update_with_ingress(
+            &pfx_v4_a,
+            Some("[111,222]"),
+            10,
+        ))
+        .await
+        .unwrap();
+    runner
+        .process_update(mk_route_update_with_ingress(
+            &pfx_v4_b,
+            Some("[111,333]"),
+            20,
+        ))
+        .await
+        .unwrap();
+    runner
+        .process_update(mk_route_update_with_ingress(
+            &pfx_v6,
+            Some("[111,444]"),
+            10,
+        ))
+        .await
+        .unwrap();
+
+    // Withdraw pfx_v4_b (its only record), so it must drop out of the dump.
+    runner
+        .process_update(mk_route_update_with_ingress(&pfx_v4_b, None, 20))
+        .await
+        .unwrap();
+
+    let mut seen: Vec<(Prefix, u32)> = Vec::new();
+    let count = rib
+        .stream_prefix_records(|pr| {
+            for rec in &pr.meta {
+                assert_ne!(
+                    rec.status,
+                    rotonda_store::prefix_record::RouteStatus::Withdrawn,
+                    "withdrawn records must be filtered before the closure"
+                );
+                seen.push((pr.prefix, rec.multi_uniq_id));
+            }
+            true
+        })
+        .unwrap();
+
+    // The two active prefixes (across both families) are emitted...
+    assert!(seen.contains(&(pfx_v4_a, 10)));
+    assert!(seen.contains(&(pfx_v6, 10)));
+    // ...the withdrawn one is not...
+    assert!(
+        !seen.iter().any(|(p, _)| *p == pfx_v4_b),
+        "withdrawn prefix must not be emitted"
+    );
+    // ...and a single walk covers both IPv4 and IPv6.
+    assert!(seen.iter().any(|(p, _)| p.is_v4()));
+    assert!(seen.iter().any(|(p, _)| !p.is_v4()));
+    // `count` is the number of emitted prefixes (one record each here).
+    assert_eq!(count, 2);
+    assert_eq!(seen.len(), 2);
+}
+
 /// `gc_disconnected_bmp_peers` must reclaim idle BMP router (parent) entries,
 /// not just BgpViaBmp peers — otherwise every torn-down router (incl. every
 /// port scan / half-open connection that mints a childless provisional entry)

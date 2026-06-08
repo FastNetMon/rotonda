@@ -218,6 +218,7 @@ impl Api {
 pub enum ApiError {
     BadRequest(String),
     InternalServerError(String),
+    ServiceUnavailable(String),
 }
 
 impl axum::response::IntoResponse for ApiError {
@@ -239,6 +240,10 @@ impl axum::response::IntoResponse for ApiError {
                 }
                 ApiError::InternalServerError(msg) => (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    to_json(msg),
+                ),
+                ApiError::ServiceUnavailable(msg) => (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
                     to_json(msg),
                 ),
             },
